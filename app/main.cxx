@@ -1,478 +1,286 @@
-/*
-  FUSE: Filesystem in Userspace
-  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
-  Copyright (C) 2011       Sebastian Pipping <sebastian@pipping.org>
+#define BOOST_ASIO_ENABLE_HANDLER_TRACKING
 
-  This program can be distributed under the terms of the GNU GPL.
-  See the file COPYING.
+#include <asio.hpp>
+#include <mutex>
+#include <luxem-cxx/luxem.h>
+#include <chrono>
 
-  gcc -Wall fusexmp.c `pkg-config fuse --cflags --libs` -o fusexmp
-*/
+#include "../ren-cxx-basics/error.h"
+#include "../ren-cxx-basics/variant.h"
+#include "../ren-cxx-filesystem/file.h"
 
-#define FUSE_USE_VERSION 26
-
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
-
-#ifdef linux
-/* For pread()/pwrite()/utimensat() */
-#define _XOPEN_SOURCE 700
-#endif
-
-#include <fuse.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <dirent.h>
-#include <errno.h>
-#include <sys/time.h>
-#ifdef HAVE_SETXATTR
-#include <sys/xattr.h>
-#endif
-
-static int xmp_getattr(const char *path, struct stat *stbuf)
+struct FilesystemT
 {
-	int res;
+	FilesystemT(void) : Count(0) {}
+	void Clean(void) {}
+	void SetCount(size_t Count) { this->Count = Count; }
+	size_t GetCount(void) const { return Count; }
 
-	res = lstat(path, stbuf);
-	if (res == -1)
-		return -errno;
+	private:
+		size_t Count;
+};
 
-	return 0;
+template <typename CallbackT>
+	void Accept(
+		asio::io_service &Service, 
+		asio::ip::tcp::acceptor &Acceptor, 
+		CallbackT &&Callback,
+		size_t RetryCount = 0)
+{
+	std::cout << "accepting" << std::endl;
+	std::shared_ptr<asio::ip::tcp::socket> Connection;
+	try
+	{
+		Connection = std::make_shared<asio::ip::tcp::socket>(Service);
+	}
+	catch (...)
+	{
+		std::cout << "accept error" << std::endl;
+		if (RetryCount >= 5) throw;
+		auto Retry = std::make_shared<asio::basic_waitable_timer<std::chrono::system_clock>>(Service, std::chrono::minutes(1));
+		auto &RetryRef = *Retry;
+		RetryRef.async_wait([&, Retry = std::move(Retry), Callback = std::move(Callback)](
+			asio::error_code const &Error)
+		{
+			Accept(Service, Acceptor, std::move(Callback), RetryCount + 1);
+		});
+		return;
+	}
+	auto &ConnectionRef = *Connection;
+	auto Endpoint = std::make_shared<asio::ip::tcp::endpoint>();
+	auto &EndpointRef = *Endpoint;
+	Acceptor.async_accept(
+		ConnectionRef, 
+		EndpointRef,
+		[&Service, &Acceptor, Endpoint = std::move(Endpoint), Connection = std::move(Connection), Callback = std::move(Callback)](
+			asio::error_code const &Error)
+		{
+			if (Error)
+			{
+				std::cerr << "Error accepting connection to " << *Endpoint << ": " 
+					"(" << Error.value() << ") " << Error << std::endl;
+				return;
+			}
+			if (Callback(std::move(Connection)))
+				Accept(Service, Acceptor, std::move(Callback));
+		});
 }
 
-static int xmp_access(const char *path, int mask)
+template <typename CallbackT>
+	void Read(
+		std::shared_ptr<asio::ip::tcp::socket> Connection, 
+		std::shared_ptr<ReadBufferT> Buffer, 
+		CallbackT &&Callback)
 {
-	int res;
-
-	res = access(path, mask);
-	if (res == -1)
-		return -errno;
-
-	return 0;
+	Buffer->Ensure(256);
+	auto BufferStart = Buffer->EmptyStart();
+	auto BufferSize = Buffer->Available();
+	auto &ConnectionRef = *Connection;
+	ConnectionRef.async_receive(
+		asio::buffer(BufferStart, BufferSize), 
+		[Connection = std::move(Connection), Buffer = std::move(Buffer), Callback = std::move(Callback)](
+			asio::error_code const &Error, 
+			size_t ReadSize) mutable
+		{
+			if (Error)
+			{
+				std::cerr << "Error reading: (" << Error.value() << ") " << Error << std::endl;
+				return;
+			}
+			Buffer->Fill(ReadSize);
+			if (Callback(*Buffer))
+				Read(
+					std::move(Connection), 
+					std::move(Buffer), 
+					std::move(Callback));
+		});
 }
 
-static int xmp_readlink(const char *path, char *buf, size_t size)
+int main(void)
 {
-	int res;
+	try
+	{
+		// Configure
+		uint16_t Port;
+		{
+			auto EnvPort = getenv("CLUNKER_PORT");
+			if (!EnvPort) 
+			{
+				throw UserErrorT() << "The environment variable CLUNKER_PORT must contain the desired IPC port number.";
+			}
+			if (!(StringT(EnvPort) >> Port)) throw UserErrorT() << "Environment variable CLUNKER_PORT has invalid port number: " << EnvPort;
+		}
 
-	res = readlink(path, buf, size - 1);
-	if (res == -1)
-		return -errno;
+		struct SharedT
+		{
+			bool Die = false;
 
-	buf[res] = '\0';
-	return 0;
-}
+			std::mutex Mutex;
+			//fuse_session *FuseSession = nullptr;
+			OptionalT<size_t> Remaining;
+			FilesystemT Filesystem;
+		};
+		auto Shared = std::make_shared<SharedT>();
 
+		// Start fuse on other thread
+		/*FuseT<FilesystemT> Fuse;
+		std::thread FuseThread([Shared](void)
+		{
+			RunFuse(
+				[Shared](fuse_session *Session) 
+				{ 
+					std::lock_guard<std::mutex> Guard(Shared->Mutex);
+					Shared->FuseSession = Session; 
+				},
+				&Shared->Filesystem);
+		});*/
 
-static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-		       off_t offset, struct fuse_file_info *fi)
-{
-	DIR *dp;
-	struct dirent *de;
+		// Start listeners on main thread
+		asio::io_service MainService;
 
-	(void) offset;
-	(void) fi;
+		asio::signal_set SignalTask(MainService, SIGINT, SIGTERM);
+		SignalTask.async_wait([Shared](asio::error_code const &Error, int SignalNumber)
+		{
+			Shared->Die = true;
+			std::lock_guard<std::mutex> Guard(Shared->Mutex);
+			/*if (Shared->FuseSession)
+				fuse_session_exit(Shared->FuseSession);*/
+		});
 
-	dp = opendir(path);
-	if (dp == NULL)
-		return -errno;
+		asio::ip::tcp::endpoint TCPEndpoint(asio::ip::tcp::v4(), Port);
+		asio::ip::tcp::acceptor TCPAcceptor(MainService, TCPEndpoint);
+		Accept(MainService, TCPAcceptor, [Shared](std::shared_ptr<asio::ip::tcp::socket> Connection)
+		{
+			auto Reader = std::make_shared<luxem::reader>();
+			Reader->element([Shared, Connection](std::shared_ptr<luxem::value> &&Data)
+			{
+				auto Error = [&](std::string Message)
+				{
+					auto Buffer = std::make_shared<std::string>(
+						luxem::writer()
+							.type("error")
+							.value(Message)
+							.dump());
+					auto const &BufferArg = asio::buffer(Buffer->c_str(), Buffer->size());
+					asio::async_write(
+						*Connection, 
+						BufferArg, 
+						[Buffer = std::move(Buffer)](
+							asio::error_code const &Error, 
+							std::size_t WroteSize)
+						{
+							// noop
+						});
+				};
 
-	while ((de = readdir(dp)) != NULL) {
-		struct stat st;
-		memset(&st, 0, sizeof(st));
-		st.st_ino = de->d_ino;
-		st.st_mode = de->d_type << 12;
-		if (filler(buf, de->d_name, &st, 0))
-			break;
+				if (!Data->has_type()) 
+				{
+					Error(StringT() 
+						<< "Message has no type: [" << luxem::writer().value(Data).dump() << "]");
+					return;
+				}
+
+				auto Type = Data->get_type();
+				if (Type == "clean")
+				{
+					std::lock_guard<std::mutex> Guard(Shared->Mutex);
+					Shared->Filesystem.Clean();
+				}
+				else if (Type == "set_count")
+				{
+					try
+					{
+						std::lock_guard<std::mutex> Guard(Shared->Mutex);
+						Shared->Filesystem.SetCount(Data->as<luxem::primitive>().get_int());
+					}
+					catch (...)
+					{
+						Error(StringT()
+							<< "Bad count [" << luxem::writer().value(Data).dump() << "]");
+					}
+				}
+				else if (Type == "get_count")
+				{
+					std::lock_guard<std::mutex> Guard(Shared->Mutex);
+					auto Buffer = std::make_shared<std::string>(
+						luxem::writer()
+							.type("count")
+							.value(Shared->Filesystem.GetCount())
+							.dump());
+					auto const &BufferArg = asio::buffer(Buffer->c_str(), Buffer->size());
+					asio::async_write(
+						*Connection, 
+						BufferArg, 
+						[Buffer = std::move(Buffer)](
+							asio::error_code const &Error, 
+							std::size_t WroteSize)
+						{
+							// noop
+						});
+				}
+				else
+				{
+					Error(StringT() <<
+						"Unknown message type [" << Type << "]");
+					return;
+				}
+			});
+			Read(std::move(Connection), std::make_shared<ReadBufferT>(), [Shared, Reader](ReadBufferT &Buffer)
+			{
+				try
+				{
+					auto Consumed = Reader->feed((char const *)Buffer.FilledStart(), Buffer.Filled(), false);
+					Buffer.Consume(Consumed);
+				}
+				catch (UserErrorT const &Error)
+				{
+					std::cerr << "Error: " << Error << std::endl;
+					return false;
+				}
+				catch (SystemErrorT const &Error)
+				{
+					std::cerr << "System error: " << Error << std::endl;
+					return false;
+				}
+				catch (ConstructionErrorT const &Error)
+				{
+					std::cerr << "Uncaught error: " << Error << std::endl;
+					return false;
+				}
+				catch (std::runtime_error const &Error)
+				{
+					std::cerr << "Uncaught error: " << Error.what() << std::endl;
+					return false;
+				}
+				return !Shared->Die;
+			});
+			return !Shared->Die;
+		});
+
+		MainService.run();
+
+		//FuseThread.join();
+	}
+	catch (UserErrorT const &Error)
+	{
+		std::cerr << "Error: " << Error << std::endl;
+		return 1;
+	}
+	catch (SystemErrorT const &Error)
+	{
+		std::cerr << "System error: " << Error << std::endl;
+		return 1;
+	}
+	catch (ConstructionErrorT const &Error)
+	{
+		std::cerr << "Uncaught error: " << Error << std::endl;
+		return 1;
+	}
+	catch (std::runtime_error const &Error)
+	{
+		std::cerr << "Uncaught error: " << Error.what() << std::endl;
+		return 1;
 	}
 
-	closedir(dp);
 	return 0;
-}
-
-static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
-{
-	int res;
-
-	/* On Linux this could just be 'mknod(path, mode, rdev)' but this
-	   is more portable */
-	if (S_ISREG(mode)) {
-		res = open(path, O_CREAT | O_EXCL | O_WRONLY, mode);
-		if (res >= 0)
-			res = close(res);
-	} else if (S_ISFIFO(mode))
-		res = mkfifo(path, mode);
-	else
-		res = mknod(path, mode, rdev);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_mkdir(const char *path, mode_t mode)
-{
-	int res;
-
-	res = mkdir(path, mode);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_unlink(const char *path)
-{
-	int res;
-
-	res = unlink(path);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_rmdir(const char *path)
-{
-	int res;
-
-	res = rmdir(path);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_symlink(const char *from, const char *to)
-{
-	int res;
-
-	res = symlink(from, to);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_rename(const char *from, const char *to)
-{
-	int res;
-
-	res = rename(from, to);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_link(const char *from, const char *to)
-{
-	int res;
-
-	res = link(from, to);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_chmod(const char *path, mode_t mode)
-{
-	int res;
-
-	res = chmod(path, mode);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_chown(const char *path, uid_t uid, gid_t gid)
-{
-	int res;
-
-	res = lchown(path, uid, gid);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_truncate(const char *path, off_t size)
-{
-	int res;
-
-	res = truncate(path, size);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-#ifdef HAVE_UTIMENSAT
-static int xmp_utimens(const char *path, const struct timespec ts[2])
-{
-	int res;
-
-	/* don't use utime/utimes since they follow symlinks */
-	res = utimensat(0, path, ts, AT_SYMLINK_NOFOLLOW);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-#endif
-
-static int xmp_open(const char *path, struct fuse_file_info *fi)
-{
-	int res;
-
-	res = open(path, fi->flags);
-	if (res == -1)
-		return -errno;
-
-	close(res);
-	return 0;
-}
-
-static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
-		    struct fuse_file_info *fi)
-{
-	int fd;
-	int res;
-
-	(void) fi;
-	fd = open(path, O_RDONLY);
-	if (fd == -1)
-		return -errno;
-
-	res = pread(fd, buf, size, offset);
-	if (res == -1)
-		res = -errno;
-
-	close(fd);
-	return res;
-}
-
-static int xmp_write(const char *path, const char *buf, size_t size,
-		     off_t offset, struct fuse_file_info *fi)
-{
-	int fd;
-	int res;
-
-	(void) fi;
-	fd = open(path, O_WRONLY);
-	if (fd == -1)
-		return -errno;
-
-	res = pwrite(fd, buf, size, offset);
-	if (res == -1)
-		res = -errno;
-
-	close(fd);
-	return res;
-}
-
-static int xmp_statfs(const char *path, struct statvfs *stbuf)
-{
-	int res;
-
-	res = statvfs(path, stbuf);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_release(const char *path, struct fuse_file_info *fi)
-{
-	/* Just a stub.	 This method is optional and can safely be left
-	   unimplemented */
-
-	(void) path;
-	(void) fi;
-	return 0;
-}
-
-static int xmp_fsync(const char *path, int isdatasync,
-		     struct fuse_file_info *fi)
-{
-	/* Just a stub.	 This method is optional and can safely be left
-	   unimplemented */
-
-	(void) path;
-	(void) isdatasync;
-	(void) fi;
-	return 0;
-}
-
-#ifdef HAVE_POSIX_FALLOCATE
-static int xmp_fallocate(const char *path, int mode,
-			off_t offset, off_t length, struct fuse_file_info *fi)
-{
-	int fd;
-	int res;
-
-	(void) fi;
-
-	if (mode)
-		return -EOPNOTSUPP;
-
-	fd = open(path, O_WRONLY);
-	if (fd == -1)
-		return -errno;
-
-	res = -posix_fallocate(fd, offset, length);
-
-	close(fd);
-	return res;
-}
-#endif
-
-#ifdef HAVE_SETXATTR
-/* xattr operations are optional and can safely be left unimplemented */
-static int xmp_setxattr(const char *path, const char *name, const char *value,
-			size_t size, int flags)
-{
-	int res = lsetxattr(path, name, value, size, flags);
-	if (res == -1)
-		return -errno;
-	return 0;
-}
-
-static int xmp_getxattr(const char *path, const char *name, char *value,
-			size_t size)
-{
-	int res = lgetxattr(path, name, value, size);
-	if (res == -1)
-		return -errno;
-	return res;
-}
-
-static int xmp_listxattr(const char *path, char *list, size_t size)
-{
-	int res = llistxattr(path, list, size);
-	if (res == -1)
-		return -errno;
-	return res;
-}
-
-static int xmp_removexattr(const char *path, const char *name)
-{
-	int res = lremovexattr(path, name);
-	if (res == -1)
-		return -errno;
-	return 0;
-}
-#endif /* HAVE_SETXATTR */
-
-static struct fuse_operations xmp_oper;
-
-int main(int argc, char *argv[])
-{
-	xmp_oper.getattr	= xmp_getattr;
-	xmp_oper.access		= xmp_access;
-	xmp_oper.readlink	= xmp_readlink;
-	xmp_oper.readdir	= xmp_readdir;
-	xmp_oper.mknod		= xmp_mknod;
-	xmp_oper.mkdir		= xmp_mkdir;
-	xmp_oper.symlink	= xmp_symlink;
-	xmp_oper.unlink		= xmp_unlink;
-	xmp_oper.rmdir		= xmp_rmdir;
-	xmp_oper.rename		= xmp_rename;
-	xmp_oper.link		= xmp_link;
-	xmp_oper.chmod		= xmp_chmod;
-	xmp_oper.chown		= xmp_chown;
-	xmp_oper.truncate	= xmp_truncate;
-#ifdef HAVE_UTIMENSAT
-	xmp_oper.utimens	= xmp_utimens;
-#endif
-	xmp_oper.open		= xmp_open;
-	xmp_oper.read		= xmp_read;
-	xmp_oper.write		= xmp_write;
-	xmp_oper.statfs		= xmp_statfs;
-	xmp_oper.release	= xmp_release;
-	xmp_oper.fsync		= xmp_fsync;
-#ifdef HAVE_POSIX_FALLOCATE
-	xmp_oper.fallocate	= xmp_fallocate;
-#endif
-#ifdef HAVE_SETXATTR
-	xmp_oper.setxattr	= xmp_setxattr;
-	xmp_oper.getxattr	= xmp_getxattr;
-	xmp_oper.listxattr	= xmp_listxattr;
-	xmp_oper.removexattr	= xmp_removexattr;
-#endif
-	umask(0);
-
-	struct FuseArgsT : fuse_args
-	{
-		FuseArgsT(void)
-		{
-			allocated = false;
-			argv = nullptr;
-			argc = 0;
-		}
-
-		void Add(std::string const &Arg)
-		{
-			ArgStrings.push_back(Arg);
-			ArgArray.clear();
-			for (auto const &Arg : ArgStrings)
-				ArgArray.push_back(Arg.c_str());
-			argv = &ArgArray[0];
-			argc = ArgArray.size();
-		}
-
-		std::vector<char const *> ArgArray;
-		std::vector<std::string> ArgStrings;
-	};
-
-	struct MountT
-	{
-		fuse_chan *Channel;
-
-		MountT(void) : Channel(nullptr)
-		{
-			FuseArgsT Args;
-			Channel = fuse_mount("q", &Args);
-			if (!Channel) throw InitializationErrorT() << "Couldn't mount filesystem.";
-		}
-
-		~MountT(void)
-		{
-			fuse_unmount("q", Channel);
-		}
-	};
-
-	typedef fuse_operations CallbacksT;
-	struct FuseContextT
-	{
-		fuse *Context;
-
-		FuseContextT(MountT &Mount, CallbacksT &Callbacks) : Context(nullptr)
-		{
-			FuseArgsT Args;
-			Context = fuse_new(
-				Mount.Channel,
-				&Args,
-				&Callbacks,
-				sizeof(Callbacks)
-				nullptr);
-			if (!Context)
-				throw InitializationErrorT() << "Failed to initialize fuse context.";
-		}
-
-		~FuseContextT(void)
-		{
-			fuse_destroy(Context);
-		}
-	};
-
-	MountT Mount{};
-	FuseContextT Context(Mount, xmp_oper);
-	return fuse_loop(Context.Context);
 }
