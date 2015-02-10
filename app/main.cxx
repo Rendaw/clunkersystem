@@ -4,20 +4,48 @@
 #include <mutex>
 #include <luxem-cxx/luxem.h>
 #include <chrono>
+#include <thread>
 
 #include "../ren-cxx-basics/error.h"
 #include "../ren-cxx-basics/variant.h"
 #include "../ren-cxx-filesystem/file.h"
 
+#include "fuse_wrapper.h"
+
+struct FileT
+{
+	struct stat stat;
+	OptionalT<std::vector<uint8_t>> Data;
+};
+
 struct FilesystemT
 {
-	FilesystemT(void) : Count(0) {}
-	void Clean(void) {}
+	FilesystemT(void) : Count(-1) {}
+	void Clean(void) { Files.clear(); }
 	void SetCount(size_t Count) { this->Count = Count; }
 	size_t GetCount(void) const { return Count; }
 
+	bool DecrementCount(void)
+	{
+		if (Count < 0) return true;
+		Count -= 1;
+		if (Count == 0) return false;
+		return true;
+	}
+
+	int getattr(const char *path, struct stat *buf)
+	{
+		if (!DecrementCount()) return -EIO;
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		*buf = Found->second.stat;
+		return 0;
+	}
+
 	private:
-		size_t Count;
+		int64_t Count;
+
+		std::map<std::string, FileT> Files;
 };
 
 template <typename CallbackT>
@@ -96,11 +124,13 @@ template <typename CallbackT>
 		});
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	try
 	{
 		// Configure
+		if (argc < 2) throw UserErrorT() << "You must specify the mount point on the command line.";
+		
 		uint16_t Port;
 		{
 			auto EnvPort = getenv("CLUNKER_PORT");
@@ -116,43 +146,35 @@ int main(void)
 			bool Die = false;
 
 			std::mutex Mutex;
-			//fuse_session *FuseSession = nullptr;
-			OptionalT<size_t> Remaining;
 			FilesystemT Filesystem;
-		};
-		auto Shared = std::make_shared<SharedT>();
+			FuseT<FilesystemT> Fuse;
+
+			SharedT(std::string const &Path) : Fuse(Path, Filesystem) {}
+		} Shared(argv[1]);
 
 		// Start fuse on other thread
-		/*FuseT<FilesystemT> Fuse;
-		std::thread FuseThread([Shared](void)
-		{
-			RunFuse(
-				[Shared](fuse_session *Session) 
-				{ 
-					std::lock_guard<std::mutex> Guard(Shared->Mutex);
-					Shared->FuseSession = Session; 
-				},
-				&Shared->Filesystem);
-		});*/
+		std::thread FuseThread([&Fuse = Shared.Fuse](void) { Fuse.Run(); });
 
 		// Start listeners on main thread
 		asio::io_service MainService;
 
 		asio::signal_set SignalTask(MainService, SIGINT, SIGTERM);
-		SignalTask.async_wait([Shared](asio::error_code const &Error, int SignalNumber)
+		SignalTask.async_wait([&Shared, &MainService](asio::error_code const &Error, int SignalNumber)
 		{
-			Shared->Die = true;
-			std::lock_guard<std::mutex> Guard(Shared->Mutex);
-			/*if (Shared->FuseSession)
-				fuse_session_exit(Shared->FuseSession);*/
+			Shared.Die = true;
+			{
+				std::lock_guard<std::mutex> Guard(Shared.Mutex);
+				Shared.Fuse.Kill();
+			}
+			MainService.stop();
 		});
 
 		asio::ip::tcp::endpoint TCPEndpoint(asio::ip::tcp::v4(), Port);
 		asio::ip::tcp::acceptor TCPAcceptor(MainService, TCPEndpoint);
-		Accept(MainService, TCPAcceptor, [Shared](std::shared_ptr<asio::ip::tcp::socket> Connection)
+		Accept(MainService, TCPAcceptor, [&Shared](std::shared_ptr<asio::ip::tcp::socket> Connection)
 		{
 			auto Reader = std::make_shared<luxem::reader>();
-			Reader->element([Shared, Connection](std::shared_ptr<luxem::value> &&Data)
+			Reader->element([&Shared, Connection](std::shared_ptr<luxem::value> &&Data)
 			{
 				auto Error = [&](std::string Message)
 				{
@@ -183,15 +205,15 @@ int main(void)
 				auto Type = Data->get_type();
 				if (Type == "clean")
 				{
-					std::lock_guard<std::mutex> Guard(Shared->Mutex);
-					Shared->Filesystem.Clean();
+					std::lock_guard<std::mutex> Guard(Shared.Mutex);
+					Shared.Filesystem.Clean();
 				}
 				else if (Type == "set_count")
 				{
 					try
 					{
-						std::lock_guard<std::mutex> Guard(Shared->Mutex);
-						Shared->Filesystem.SetCount(Data->as<luxem::primitive>().get_int());
+						std::lock_guard<std::mutex> Guard(Shared.Mutex);
+						Shared.Filesystem.SetCount(Data->as<luxem::primitive>().get_int());
 					}
 					catch (...)
 					{
@@ -201,11 +223,11 @@ int main(void)
 				}
 				else if (Type == "get_count")
 				{
-					std::lock_guard<std::mutex> Guard(Shared->Mutex);
+					std::lock_guard<std::mutex> Guard(Shared.Mutex);
 					auto Buffer = std::make_shared<std::string>(
 						luxem::writer()
 							.type("count")
-							.value(Shared->Filesystem.GetCount())
+							.value(Shared.Filesystem.GetCount())
 							.dump());
 					auto const &BufferArg = asio::buffer(Buffer->c_str(), Buffer->size());
 					asio::async_write(
@@ -225,7 +247,7 @@ int main(void)
 					return;
 				}
 			});
-			Read(std::move(Connection), std::make_shared<ReadBufferT>(), [Shared, Reader](ReadBufferT &Buffer)
+			Read(std::move(Connection), std::make_shared<ReadBufferT>(), [&Shared, Reader](ReadBufferT &Buffer)
 			{
 				try
 				{
@@ -252,14 +274,14 @@ int main(void)
 					std::cerr << "Uncaught error: " << Error.what() << std::endl;
 					return false;
 				}
-				return !Shared->Die;
+				return !Shared.Die;
 			});
-			return !Shared->Die;
+			return !Shared.Die;
 		});
 
 		MainService.run();
 
-		//FuseThread.join();
+		FuseThread.join();
 	}
 	catch (UserErrorT const &Error)
 	{
