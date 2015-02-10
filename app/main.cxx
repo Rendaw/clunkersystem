@@ -12,6 +12,14 @@
 
 #include "fuse_wrapper.h"
 
+std::vector<function<void(void)>> SignalHandlers;
+
+void HandleSignal(int SignalNumber)
+{ 
+	std::cout << "Got signal " << SignalNumber << std::endl;
+	for (auto const &Handler : SignalHandlers) Handler(); 
+}
+
 struct FileT
 {
 	struct stat stat;
@@ -55,7 +63,6 @@ template <typename CallbackT>
 		CallbackT &&Callback,
 		size_t RetryCount = 0)
 {
-	std::cout << "accepting" << std::endl;
 	std::shared_ptr<asio::ip::tcp::socket> Connection;
 	try
 	{
@@ -63,7 +70,6 @@ template <typename CallbackT>
 	}
 	catch (...)
 	{
-		std::cout << "accept error" << std::endl;
 		if (RetryCount >= 5) throw;
 		auto Retry = std::make_shared<asio::basic_waitable_timer<std::chrono::system_clock>>(Service, std::chrono::minutes(1));
 		auto &RetryRef = *Retry;
@@ -145,6 +151,9 @@ int main(int argc, char **argv)
 		{
 			bool Die = false;
 
+			std::exception_ptr ChildException;
+			asio::io_service MainService;
+
 			std::mutex Mutex;
 			FilesystemT Filesystem;
 			FuseT<FilesystemT> Fuse;
@@ -152,26 +161,31 @@ int main(int argc, char **argv)
 			SharedT(std::string const &Path) : Fuse(Path, Filesystem) {}
 		} Shared(argv[1]);
 
-		// Start fuse on other thread
-		std::thread FuseThread([&Fuse = Shared.Fuse](void) { Fuse.Run(); });
-
-		// Start listeners on main thread
-		asio::io_service MainService;
-
-		asio::signal_set SignalTask(MainService, SIGINT, SIGTERM);
-		SignalTask.async_wait([&Shared, &MainService](asio::error_code const &Error, int SignalNumber)
+		{
+			struct sigaction HandlerInfo;
+			memset(&HandlerInfo, 0, sizeof(struct sigaction));
+			HandlerInfo.sa_handler = HandleSignal;
+			sigemptyset(&(HandlerInfo.sa_mask));
+			HandlerInfo.sa_flags = 0;
+			sigaction(SIGINT, &HandlerInfo, NULL);
+			sigaction(SIGTERM, &HandlerInfo, NULL);
+			sigaction(SIGHUP, &HandlerInfo, NULL);
+		}
+		SignalHandlers.push_back([&Shared](void)
 		{
 			Shared.Die = true;
-			{
-				std::lock_guard<std::mutex> Guard(Shared.Mutex);
-				Shared.Fuse.Kill();
-			}
-			MainService.stop();
+			Shared.Fuse.Kill();
+			Shared.MainService.stop();
+		});
+		FinallyT SignalCleanup([](void)
+		{
+			SignalHandlers.clear();
 		});
 
+		// Start listeners on IPC thread
 		asio::ip::tcp::endpoint TCPEndpoint(asio::ip::tcp::v4(), Port);
-		asio::ip::tcp::acceptor TCPAcceptor(MainService, TCPEndpoint);
-		Accept(MainService, TCPAcceptor, [&Shared](std::shared_ptr<asio::ip::tcp::socket> Connection)
+		asio::ip::tcp::acceptor TCPAcceptor(Shared.MainService, TCPEndpoint);
+		Accept(Shared.MainService, TCPAcceptor, [&Shared](std::shared_ptr<asio::ip::tcp::socket> Connection)
 		{
 			auto Reader = std::make_shared<luxem::reader>();
 			Reader->element([&Shared, Connection](std::shared_ptr<luxem::value> &&Data)
@@ -279,9 +293,28 @@ int main(int argc, char **argv)
 			return !Shared.Die;
 		});
 
-		MainService.run();
+		std::thread IPCThread([&Shared](void) 
+		{ 
+			try
+			{
+				Shared.MainService.run();
+				std::cout << "IPC stopped " << std::endl;
+			}
+			catch (...)
+			{
+				Shared.ChildException = std::current_exception();
+			}
+		});
 
-		FuseThread.join();
+		// Start fuse on other thread
+		auto Result = Shared.Fuse.Run(); 
+		std::cout << "Fuse stopped " << std::endl;
+
+		IPCThread.join();
+		if (Shared.ChildException)
+			std::rethrow_exception(Shared.ChildException);
+
+		return Result;
 	}
 	catch (UserErrorT const &Error)
 	{
@@ -303,6 +336,5 @@ int main(int argc, char **argv)
 		std::cerr << "Uncaught error: " << Error.what() << std::endl;
 		return 1;
 	}
-
-	return 0;
 }
+

@@ -27,7 +27,6 @@ template <typename FilesystemT> struct FuseT
 	int Run(void)
 	{
 		auto Result = fuse_loop(Context.Context);
-		std::cout << "fuse_loop exited" << std::endl;
 		return Result;
 	}
 
@@ -35,7 +34,6 @@ template <typename FilesystemT> struct FuseT
 	{
 		fuse_session_exit(Context.Session);
 	}
-
 
 	private:
 
@@ -74,14 +72,24 @@ template <typename FilesystemT> struct FuseT
 				if (!Channel) throw ConstructionErrorT() << "Couldn't mount filesystem.";
 			}
 
+			void Destroy(void)
+			{
+				if (Channel)
+				{
+					fuse_unmount(Path.c_str(), Channel);
+					Channel = nullptr;
+				}
+			}
+
 			~MountT(void)
 			{
-				fuse_unmount(Path.c_str(), Channel);
+				Destroy();
 			}
 		};
 
 		struct ContextT
 		{
+			MountT &Mount;
 			static fuse_operations Callbacks;
 			FilesystemT &Filesystem;
 			fuse *Context;
@@ -141,6 +149,7 @@ template <typename FilesystemT> struct FuseT
 			PREP_SET_CALLBACK(fallocate)
 
 			ContextT(FilesystemT &Filesystem, MountT &Mount) : 
+				Mount(Mount), 
 				Filesystem(Filesystem),
 				Context(nullptr)
 			{
@@ -200,6 +209,7 @@ template <typename FilesystemT> struct FuseT
 
 			~ContextT(void)
 			{
+				Mount.Destroy();
 				fuse_destroy(Context);
 			}
 		};
