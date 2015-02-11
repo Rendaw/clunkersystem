@@ -20,15 +20,37 @@ void HandleSignal(int SignalNumber)
 	for (auto const &Handler : SignalHandlers) Handler(); 
 }
 
+struct timespec Now(void)
+{
+	struct timespec Out;
+	clock_gettime(CLOCK_REALTIME, &Out);
+	return Out;
+}
+
 struct FileT
 {
 	struct stat stat;
 	OptionalT<std::vector<uint8_t>> Data;
+
+	FileT(void) : stat() {}
 };
 
 struct FilesystemT
 {
-	FilesystemT(void) : Count(-1) {}
+	FilesystemT(void) : Count(-1) 
+	{
+		auto Root = Files.emplace(std::string("/"), FileT{}).first;
+		auto &stat = Root->second.stat;
+		stat.st_atim = Now();
+		stat.st_mtim = Now();
+		stat.st_ctim = Now();
+		stat.st_mode = 
+			S_IFDIR |
+			S_IRUSR | S_IWUSR | S_IXUSR |
+			S_IRGRP | S_IWGRP | S_IXGRP |
+			S_IROTH | S_IWOTH | S_IXOTH;
+	}
+
 	void Clean(void) { Files.clear(); }
 	void SetCount(size_t Count) { this->Count = Count; }
 	size_t GetCount(void) const { return Count; }
@@ -41,12 +63,43 @@ struct FilesystemT
 		return true;
 	}
 
+#define OPER if (!DecrementCount()) return -EIO;
+
 	int getattr(const char *path, struct stat *buf)
 	{
-		if (!DecrementCount()) return -EIO;
+		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
 		*buf = Found->second.stat;
+		return 0;
+	}
+
+	int opendir(const char *path, struct fuse_file_info *fi)
+	{
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		if (Found->second.Data) return -ENOTDIR;
+		return 0;
+	}
+
+	int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
+	{
+		std::string Path(path);
+		off_t Count = 0;
+		for (auto Test = ++Files.lower_bound(Path); 
+			(Test != Files.end()) &&
+			(Test->first.size() > Path.size()) &&
+			(Test->first.substr(0, Path.size()) == Path);
+			++Test)
+		{
+			OPER
+			if (Count < offset) continue;
+			Count += 1;
+			auto Filename = Test->first.substr(Path.size());
+			if (Filename.find_first_of('/') == std::string::npos) continue;
+			if (filler(buf, Filename.c_str(), &Test->second.stat, Count)) break;
+		}
 		return 0;
 	}
 

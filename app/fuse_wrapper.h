@@ -8,15 +8,20 @@
 #include "../ren-cxx-basics/error.h"
 
 
-template <typename FilesystemT, typename ReturnT, typename ...ArgsT, ReturnT (FilesystemT::*Source)(ArgsT ...)> 
-	ReturnT GlueCall(ReturnT (*&Dest)(ArgsT ...))
+template <typename MethodTypeT> struct GlueCallT;
+template <typename FilesystemT, typename ReturnT, typename ...ArgsT>
+	struct GlueCallT<ReturnT (FilesystemT::*)(ArgsT ...)> 
 {
-	Dest = [](ArgsT ...Args)
-	{ 
-		return static_cast<FilesystemT *>(fuse_get_context()->private_data)
-			->*Source(std::forward<ArgsT>(Args)...); 
-	};
-}
+	template <ReturnT (FilesystemT::*Source)(ArgsT ...)>
+		static void Apply(ReturnT (*&Dest)(ArgsT ...))
+	{
+		Dest = [](ArgsT ...Args) -> ReturnT
+		{ 
+			return (static_cast<FilesystemT *>(fuse_get_context()->private_data)->*Source)
+				(std::forward<ArgsT>(Args)...); 
+		};
+	}
+};
 
 template <typename FilesystemT> struct FuseT
 {
@@ -95,15 +100,22 @@ template <typename FilesystemT> struct FuseT
 			fuse *Context;
 			fuse_session *Session;
 
-			template <typename AnyT> static constexpr void *EnableNoop(AnyT Any) { return nullptr; }
+			struct CXXAbsurdity_LowPrecedence {};
+			struct CXXAbsurdity_HighPrecedence : CXXAbsurdity_LowPrecedence {};
 #define PREP_SET_CALLBACK(name) \
-			template < \
-				typename FilesystemT2 = FilesystemT, \
-				void * = EnableNoop(&FilesystemT2::name)> void SetCallback_##name(void) \
+			template \
+			< \
+				typename FilesystemT2, \
+				typename Enable = decltype(&FilesystemT2::name) \
+			> \
+				void SetCallback_##name(FilesystemT2 const *, CXXAbsurdity_HighPrecedence) \
 			{ \
-				GlueCall<&FilesystemT2::name>(Callbacks.name); \
+				GlueCallT<decltype(&FilesystemT2::name)>::template Apply<&FilesystemT2::name>(Callbacks.name); \
 			} \
-			void SetCallback_##name(...) {}
+			template <typename FilesystemT2> \
+				void SetCallback_##name(FilesystemT2 const *, CXXAbsurdity_LowPrecedence) \
+			{ \
+			}
 
 			PREP_SET_CALLBACK(getattr)
 			PREP_SET_CALLBACK(readlink)
@@ -153,48 +165,48 @@ template <typename FilesystemT> struct FuseT
 				Filesystem(Filesystem),
 				Context(nullptr)
 			{
-				SetCallback_getattr();
-				SetCallback_readlink();
-				SetCallback_mknod();
-				SetCallback_mkdir();
-				SetCallback_unlink();
-				SetCallback_rmdir();
-				SetCallback_symlink();
-				SetCallback_rename();
-				SetCallback_link();
-				SetCallback_chmod();
-				SetCallback_chown();
-				SetCallback_truncate();
-				SetCallback_open();
-				SetCallback_read();
-				SetCallback_write();
-				SetCallback_statfs();
-				SetCallback_flush();
-				SetCallback_release();
-				SetCallback_fsync();
-				SetCallback_setxattr();
-				SetCallback_getxattr();
-				SetCallback_listxattr();
-				SetCallback_removexattr();
-				SetCallback_opendir();
-				SetCallback_readdir();
-				SetCallback_releasedir();
-				SetCallback_fsyncdir();
-				SetCallback_init();
-				SetCallback_destroy();
-				SetCallback_access();
-				SetCallback_create();
-				SetCallback_ftruncate();
-				SetCallback_fgetattr();
-				SetCallback_lock();
-				SetCallback_utimens();
-				SetCallback_bmap();
-				SetCallback_ioctl();
-				SetCallback_poll();
-				SetCallback_write_buf();
-				SetCallback_read_buf();
-				SetCallback_flock();
-				SetCallback_fallocate();
+				SetCallback_getattr(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_readlink(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_mknod(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_mkdir(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_unlink(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_rmdir(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_symlink(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_rename(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_link(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_chmod(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_chown(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_truncate(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_open(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_read(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_write(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_statfs(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_flush(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_release(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_fsync(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_setxattr(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_getxattr(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_listxattr(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_removexattr(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_opendir(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_readdir(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_releasedir(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_fsyncdir(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_init(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_destroy(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_access(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_create(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_ftruncate(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_fgetattr(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_lock(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_utimens(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_bmap(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_ioctl(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_poll(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_write_buf(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_read_buf(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_flock(&Filesystem, CXXAbsurdity_HighPrecedence());
+				SetCallback_fallocate(&Filesystem, CXXAbsurdity_HighPrecedence());
 				ArgsT Args;
 				Context = fuse_new(
 					Mount.Channel,
