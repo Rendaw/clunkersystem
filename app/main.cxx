@@ -5,6 +5,7 @@
 #include <luxem-cxx/luxem.h>
 #include <chrono>
 #include <thread>
+#include <fcntl.h>
 
 #include "../ren-cxx-basics/error.h"
 #include "../ren-cxx-basics/variant.h"
@@ -32,7 +33,14 @@ struct FileT
 	struct stat stat;
 	OptionalT<std::vector<uint8_t>> Data;
 
-	FileT(void) : stat() {}
+	FileT(void) : stat() 
+	{
+		stat.st_atim = Now();
+		stat.st_mtim = Now();
+		stat.st_ctim = Now();
+		stat.st_uid = getuid();
+		stat.st_gid = getgid();
+	}
 };
 
 struct FilesystemT
@@ -40,11 +48,7 @@ struct FilesystemT
 	FilesystemT(void) : Count(-1) 
 	{
 		auto Root = Files.emplace(std::string("/"), FileT{}).first;
-		auto &stat = Root->second.stat;
-		stat.st_atim = Now();
-		stat.st_mtim = Now();
-		stat.st_ctim = Now();
-		stat.st_mode = 
+		Root->second.stat.st_mode = 
 			S_IFDIR |
 			S_IRUSR | S_IWUSR | S_IXUSR |
 			S_IRGRP | S_IWGRP | S_IXGRP |
@@ -79,31 +83,233 @@ struct FilesystemT
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
+		if (!CheckPermission(
+			Found->second,
+			(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
+			(fi->flags == O_WRONLY) || (fi->flags == O_RDWR),
+			false)) return -EACCES;
 		if (Found->second.Data) return -ENOTDIR;
 		return 0;
+	}
+
+	template <typename IteratorT>
+		bool InDir(IteratorT const &Test, std::string const &Path)
+	{
+		return
+			(Test != Files.end()) &&
+			(Test->first.size() > Path.size()) &&
+			(Test->first.substr(0, Path.size()) == Path);
 	}
 
 	int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 	{
 		std::string Path(path);
 		off_t Count = 0;
-		for (auto Test = ++Files.lower_bound(Path); 
-			(Test != Files.end()) &&
-			(Test->first.size() > Path.size()) &&
-			(Test->first.substr(0, Path.size()) == Path);
-			++Test)
+		for (auto Test = ++Files.lower_bound(Path); InDir(Test, Path); ++Test)
 		{
 			OPER
 			if (Count < offset) continue;
 			Count += 1;
 			auto Filename = Test->first.substr(Path.size());
-			if (Filename.find_first_of('/') == std::string::npos) continue;
+			if (Filename.find_first_of('/') != std::string::npos) continue;
 			if (filler(buf, Filename.c_str(), &Test->second.stat, Count)) break;
 		}
 		return 0;
 	}
 
+	int mkdir(const char *path, mode_t mode)
+	{
+		OPER
+		auto Root = Files.emplace(std::string(path), FileT{}).first;
+		Root->second.stat.st_mode = 
+			mode |
+			S_IFDIR;
+		return 0;
+	}
+
+	int rmdir(const char *path)
+	{
+		OPER
+		std::string Path(path);
+		auto Test = ++Files.lower_bound(Path);
+		if (InDir(Test, Path)) return -ENOTEMPTY;
+		if (Files.erase(path) != 1) return -ENOENT;
+		return 0;
+	}
+
+	int create(const char *path, mode_t mode, struct fuse_file_info *fi)
+	{
+		OPER
+		auto Root = Files.emplace(std::string(path), FileT{}).first;
+		Root->second.stat.st_mode = mode;
+		Root->second.stat.st_mode = 
+			mode |
+			S_IFREG;
+		Root->second.Data = std::vector<uint8_t>();
+		SetFile(fi, Root->second);
+		return 0;
+	}
+
+	int utimens(const char *path, const struct timespec tv[2])
+	{
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		auto &stat = Found->second.stat;
+		stat.st_atim = tv[0];
+		stat.st_mtim = tv[1];
+		return 0;
+	}
+
+	bool CheckPermission(FileT &File, bool Read, bool Write, bool Execute)
+	{
+		auto const &st_mode = File.stat.st_mode;
+		auto const &st_uid = File.stat.st_uid;
+		auto const &st_gid = File.stat.st_gid;
+		auto const uid = getuid();
+		auto const gid = getgid();
+		return
+			(
+				!Read ||
+				(
+					((st_mode & S_IRUSR) && (st_uid == uid)) ||
+					((st_mode & S_IRGRP) && (st_gid == gid)) ||
+					(st_mode & S_IROTH)
+				)
+			) ||
+			(
+				!Write ||
+				(
+					((st_mode & S_IWUSR) && (st_uid == uid)) ||
+					((st_mode & S_IWGRP) && (st_gid == gid)) ||
+					!(st_mode & S_IWOTH)
+				)
+			) ||
+			(
+				!Execute ||
+				(
+					((st_mode & S_IXUSR) && (st_uid == uid)) ||
+					((st_mode & S_IXGRP) && (st_gid == gid)) ||
+					!(st_mode & S_IXOTH)
+				)
+			);
+	}
+
+	int access(const char *path, int amode)
+	{
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		if (amode == F_OK) return 0;
+		if (!CheckPermission(
+			Found->second, 
+			amode & R_OK,
+			amode & W_OK,
+			amode & X_OK)) return -EACCES;
+		return 0;
+	}
+
+	int unlink(const char *path)
+	{
+		OPER
+		if (Files.erase(path) != 1) return -ENOENT;
+		return 0;
+	}
+
+	int open(const char *path, struct fuse_file_info *fi)
+	{
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		if (!CheckPermission(
+			Found->second,
+			(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
+			(fi->flags == O_WRONLY) || (fi->flags == O_RDWR),
+			false)) return -EACCES;
+		SetFile(fi, Found->second);
+		return 0;
+	}
+
+	int read(const char *path, char *out, size_t count, off_t start, struct fuse_file_info *fi)
+	{
+		OPER
+		auto &File = GetFile(fi);
+		size_t Good = 0;
+		size_t Zero = 0;
+		if ((unsigned int)start >= File.Data->size())
+			Zero = count;
+		else 
+		{
+			Good = std::max(count, File.Data->size() - start);
+			Zero = count - Good;
+		}
+		if (Good)
+			memcpy(out, &(*File.Data)[start], Good);
+		if (Zero)
+			memset(out + Good, 0, Zero);
+		return Good;
+	}
+
+	int write(const char *path, const char *out, size_t count, off_t start, struct fuse_file_info *fi)
+	{
+		OPER
+		auto &File = GetFile(fi);
+		auto const End = start + count;
+		if (File.Data->size() < End)
+		{
+			File.Data->resize(End);
+			File.stat.st_size = End;
+		}
+		memcpy(&(*File.Data)[start], out, count);
+		return count;
+	}
+
+	int truncate(const char *path, off_t size)
+	{
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		auto &File = Found->second;
+		off_t OldLength = File.Data->size();
+		size_t Zero = 0;
+		if (OldLength < size)
+			Zero = size - OldLength;
+		File.Data->resize(size);
+		if (Zero) memset(&(*File.Data)[OldLength], 0, Zero);
+		File.stat.st_size = size;
+		return 0;
+	}
+
+	int chmod(const char *path, mode_t mode)
+	{
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		Found->second.stat.st_mode = mode;
+		return 0;
+	}
+
+	int chown(const char *path, uid_t uid, gid_t gid)
+	{
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		Found->second.stat.st_uid = uid;
+		Found->second.stat.st_gid = gid;
+		return 0;
+	}
+
 	private:
+		void SetFile(struct fuse_file_info *fi, FileT &File)
+		{
+			fi->fh = reinterpret_cast<uint64_t>(&File);
+		}
+
+		FileT &GetFile(struct fuse_file_info *fi)
+		{
+			return *reinterpret_cast<FileT *>(fi->fh);
+		}
+
 		int64_t Count;
 
 		std::map<std::string, FileT> Files;
