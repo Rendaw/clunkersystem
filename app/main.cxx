@@ -3,7 +3,6 @@
 #include <asio.hpp>
 #include <mutex>
 #include <luxem-cxx/luxem.h>
-#include <chrono>
 #include <thread>
 #include <fcntl.h>
 
@@ -12,6 +11,7 @@
 #include "../ren-cxx-filesystem/file.h"
 
 #include "fuse_wrapper.h"
+#include "asio_utils.h"
 
 std::vector<function<void(void)>> SignalHandlers;
 
@@ -45,7 +45,7 @@ struct FileT
 
 struct FilesystemT
 {
-	FilesystemT(void) : Count(-1) 
+	FilesystemT(std::mutex &Mutex) : Mutex(Mutex), OperationCount(-1)
 	{
 		auto Root = Files.emplace(std::string("/"), FileT{}).first;
 		Root->second.stat.st_mode = 
@@ -55,251 +55,299 @@ struct FilesystemT
 			S_IROTH | S_IWOTH | S_IXOTH;
 	}
 
-	void Clean(void) { Files.clear(); }
-	void SetCount(size_t Count) { this->Count = Count; }
-	size_t GetCount(void) const { return Count; }
-
-	bool DecrementCount(void)
+	bool Clean(void) 
 	{
-		if (Count < 0) return true;
-		Count -= 1;
-		if (Count == 0) return false;
+		std::lock_guard<std::mutex> Guard(Mutex);
+		if (OpenCount > 0) return false;
+		Files.clear(); 
 		return true;
 	}
 
+	void SetCount(size_t Count) 
+	{ 
+		std::lock_guard<std::mutex> Guard(Mutex);
+		OperationCount = Count; 
+	}
+
+	size_t GetCount(void) const 
+	{ 
+		std::lock_guard<std::mutex> Guard(Mutex);
+		return OperationCount; 
+	}
+
+	friend struct FuseT<FilesystemT>;
+	private:
+
+		// FuseT interface
+		void PreOperation(void)
+		{
+			Mutex.lock();
+		}
+
+		void PostOperation(void)
+		{
+			Mutex.unlock();
+		}
+
 #define OPER if (!DecrementCount()) return -EIO;
 
-	int getattr(const char *path, struct stat *buf)
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		*buf = Found->second.stat;
-		return 0;
-	}
-
-	int opendir(const char *path, struct fuse_file_info *fi)
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		if (!CheckPermission(
-			Found->second,
-			(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
-			(fi->flags == O_WRONLY) || (fi->flags == O_RDWR),
-			false)) return -EACCES;
-		if (Found->second.Data) return -ENOTDIR;
-		return 0;
-	}
-
-	template <typename IteratorT>
-		bool InDir(IteratorT const &Test, std::string const &Path)
-	{
-		return
-			(Test != Files.end()) &&
-			(Test->first.size() > Path.size()) &&
-			(Test->first.substr(0, Path.size()) == Path);
-	}
-
-	int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
-	{
-		std::string Path(path);
-		off_t Count = 0;
-		for (auto Test = ++Files.lower_bound(Path); InDir(Test, Path); ++Test)
+		int getattr(const char *path, struct stat *buf)
 		{
 			OPER
-			if (Count < offset) continue;
-			Count += 1;
-			auto Filename = Test->first.substr(Path.size());
-			if (Filename.find_first_of('/') != std::string::npos) continue;
-			if (filler(buf, Filename.c_str(), &Test->second.stat, Count)) break;
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			*buf = Found->second.stat;
+			return 0;
 		}
-		return 0;
-	}
 
-	int mkdir(const char *path, mode_t mode)
-	{
-		OPER
-		auto Root = Files.emplace(std::string(path), FileT{}).first;
-		Root->second.stat.st_mode = 
-			mode |
-			S_IFDIR;
-		return 0;
-	}
-
-	int rmdir(const char *path)
-	{
-		OPER
-		std::string Path(path);
-		auto Test = ++Files.lower_bound(Path);
-		if (InDir(Test, Path)) return -ENOTEMPTY;
-		if (Files.erase(path) != 1) return -ENOENT;
-		return 0;
-	}
-
-	int create(const char *path, mode_t mode, struct fuse_file_info *fi)
-	{
-		OPER
-		auto Root = Files.emplace(std::string(path), FileT{}).first;
-		Root->second.stat.st_mode = mode;
-		Root->second.stat.st_mode = 
-			mode |
-			S_IFREG;
-		Root->second.Data = std::vector<uint8_t>();
-		SetFile(fi, Root->second);
-		return 0;
-	}
-
-	int utimens(const char *path, const struct timespec tv[2])
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		auto &stat = Found->second.stat;
-		stat.st_atim = tv[0];
-		stat.st_mtim = tv[1];
-		return 0;
-	}
-
-	bool CheckPermission(FileT &File, bool Read, bool Write, bool Execute)
-	{
-		auto const &st_mode = File.stat.st_mode;
-		auto const &st_uid = File.stat.st_uid;
-		auto const &st_gid = File.stat.st_gid;
-		auto const uid = getuid();
-		auto const gid = getgid();
-		return
-			(
-				!Read ||
-				(
-					((st_mode & S_IRUSR) && (st_uid == uid)) ||
-					((st_mode & S_IRGRP) && (st_gid == gid)) ||
-					(st_mode & S_IROTH)
-				)
-			) ||
-			(
-				!Write ||
-				(
-					((st_mode & S_IWUSR) && (st_uid == uid)) ||
-					((st_mode & S_IWGRP) && (st_gid == gid)) ||
-					!(st_mode & S_IWOTH)
-				)
-			) ||
-			(
-				!Execute ||
-				(
-					((st_mode & S_IXUSR) && (st_uid == uid)) ||
-					((st_mode & S_IXGRP) && (st_gid == gid)) ||
-					!(st_mode & S_IXOTH)
-				)
-			);
-	}
-
-	int access(const char *path, int amode)
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		if (amode == F_OK) return 0;
-		if (!CheckPermission(
-			Found->second, 
-			amode & R_OK,
-			amode & W_OK,
-			amode & X_OK)) return -EACCES;
-		return 0;
-	}
-
-	int unlink(const char *path)
-	{
-		OPER
-		if (Files.erase(path) != 1) return -ENOENT;
-		return 0;
-	}
-
-	int open(const char *path, struct fuse_file_info *fi)
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		if (!CheckPermission(
-			Found->second,
-			(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
-			(fi->flags == O_WRONLY) || (fi->flags == O_RDWR),
-			false)) return -EACCES;
-		SetFile(fi, Found->second);
-		return 0;
-	}
-
-	int read(const char *path, char *out, size_t count, off_t start, struct fuse_file_info *fi)
-	{
-		OPER
-		auto &File = GetFile(fi);
-		size_t Good = 0;
-		size_t Zero = 0;
-		if ((unsigned int)start >= File.Data->size())
-			Zero = count;
-		else 
+		int opendir(const char *path, struct fuse_file_info *fi)
 		{
-			Good = std::max(count, File.Data->size() - start);
-			Zero = count - Good;
+			OPER
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			if (!CheckPermission(
+				Found->second,
+				(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
+				(fi->flags == O_WRONLY) || (fi->flags == O_RDWR),
+				false)) return -EACCES;
+			if (Found->second.Data) return -ENOTDIR;
+			OpenCount += 1;
+			return 0;
 		}
-		if (Good)
-			memcpy(out, &(*File.Data)[start], Good);
-		if (Zero)
-			memset(out + Good, 0, Zero);
-		return Good;
-	}
 
-	int write(const char *path, const char *out, size_t count, off_t start, struct fuse_file_info *fi)
-	{
-		OPER
-		auto &File = GetFile(fi);
-		auto const End = start + count;
-		if (File.Data->size() < End)
+		template <typename IteratorT>
+			bool InDir(IteratorT const &Test, std::string const &Path)
 		{
-			File.Data->resize(End);
-			File.stat.st_size = End;
+			return
+				(Test != Files.end()) &&
+				(Test->first.size() > Path.size()) &&
+				(Test->first.substr(0, Path.size()) == Path);
 		}
-		memcpy(&(*File.Data)[start], out, count);
-		return count;
-	}
 
-	int truncate(const char *path, off_t size)
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		auto &File = Found->second;
-		off_t OldLength = File.Data->size();
-		size_t Zero = 0;
-		if (OldLength < size)
-			Zero = size - OldLength;
-		File.Data->resize(size);
-		if (Zero) memset(&(*File.Data)[OldLength], 0, Zero);
-		File.stat.st_size = size;
-		return 0;
-	}
+		int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
+		{
+			std::string Path(path);
+			off_t Count = 0;
+			for (auto Test = ++Files.lower_bound(Path); InDir(Test, Path); ++Test)
+			{
+				OPER
+				if (Count < offset) continue;
+				Count += 1;
+				auto Filename = Test->first.substr(Path.size());
+				if (Filename.find_first_of('/') != std::string::npos) continue;
+				if (filler(buf, Filename.c_str(), &Test->second.stat, Count)) break;
+			}
+			return 0;
+		}
 
-	int chmod(const char *path, mode_t mode)
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		Found->second.stat.st_mode = mode;
-		return 0;
-	}
+		int releasedir(const char *path, struct fuse_file_info *fi)
+		{
+			OpenCount -= 1;
+			AssertGTE(OpenCount, 0);
+			return 0;
+		}
 
-	int chown(const char *path, uid_t uid, gid_t gid)
-	{
-		OPER
-		auto Found = Files.find(path);
-		if (Found == Files.end()) return -ENOENT;
-		Found->second.stat.st_uid = uid;
-		Found->second.stat.st_gid = gid;
-		return 0;
-	}
+		int mkdir(const char *path, mode_t mode)
+		{
+			OPER
+			auto Root = Files.emplace(std::string(path), FileT{}).first;
+			Root->second.stat.st_mode = 
+				mode |
+				S_IFDIR;
+			return 0;
+		}
 
-	private:
+		int rmdir(const char *path)
+		{
+			OPER
+			std::string Path(path);
+			auto Test = ++Files.lower_bound(Path);
+			if (InDir(Test, Path)) return -ENOTEMPTY;
+			if (Files.erase(path) != 1) return -ENOENT;
+			return 0;
+		}
+
+		int create(const char *path, mode_t mode, struct fuse_file_info *fi)
+		{
+			OPER
+			auto Root = Files.emplace(std::string(path), FileT{}).first;
+			Root->second.stat.st_mode = mode;
+			Root->second.stat.st_mode = 
+				mode |
+				S_IFREG;
+			Root->second.Data = std::vector<uint8_t>();
+			SetFile(fi, Root->second);
+			OpenCount += 1;
+			return 0;
+		}
+		
+		int release(const char *path, struct fuse_file_info *fi)
+		{
+			OpenCount -= 1;
+			AssertGTE(OpenCount, 0);
+			return 0;
+		}
+
+		int utimens(const char *path, const struct timespec tv[2])
+		{
+			OPER
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			auto &stat = Found->second.stat;
+			stat.st_atim = tv[0];
+			stat.st_mtim = tv[1];
+			return 0;
+		}
+
+		bool CheckPermission(FileT &File, bool Read, bool Write, bool Execute)
+		{
+			auto const &st_mode = File.stat.st_mode;
+			auto const &st_uid = File.stat.st_uid;
+			auto const &st_gid = File.stat.st_gid;
+			auto const uid = getuid();
+			auto const gid = getgid();
+			return
+				(
+					!Read ||
+					(
+						((st_mode & S_IRUSR) && (st_uid == uid)) ||
+						((st_mode & S_IRGRP) && (st_gid == gid)) ||
+						(st_mode & S_IROTH)
+					)
+				) ||
+				(
+					!Write ||
+					(
+						((st_mode & S_IWUSR) && (st_uid == uid)) ||
+						((st_mode & S_IWGRP) && (st_gid == gid)) ||
+						!(st_mode & S_IWOTH)
+					)
+				) ||
+				(
+					!Execute ||
+					(
+						((st_mode & S_IXUSR) && (st_uid == uid)) ||
+						((st_mode & S_IXGRP) && (st_gid == gid)) ||
+						!(st_mode & S_IXOTH)
+					)
+				);
+		}
+
+		int access(const char *path, int amode)
+		{
+			OPER
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			if (amode == F_OK) return 0;
+			if (!CheckPermission(
+				Found->second, 
+				amode & R_OK,
+				amode & W_OK,
+				amode & X_OK)) return -EACCES;
+			return 0;
+		}
+
+		int unlink(const char *path)
+		{
+			OPER
+			if (Files.erase(path) != 1) return -ENOENT;
+			return 0;
+		}
+
+		int open(const char *path, struct fuse_file_info *fi)
+		{
+			OPER
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			if (!CheckPermission(
+				Found->second,
+				(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
+				(fi->flags == O_WRONLY) || (fi->flags == O_RDWR),
+				false)) return -EACCES;
+			SetFile(fi, Found->second);
+			OpenCount += 1;
+			return 0;
+		}
+
+		int read(const char *path, char *out, size_t count, off_t start, struct fuse_file_info *fi)
+		{
+			OPER
+			auto &File = GetFile(fi);
+			size_t Good = 0;
+			size_t Zero = 0;
+			if ((unsigned int)start >= File.Data->size())
+				Zero = count;
+			else 
+			{
+				Good = std::max(count, File.Data->size() - start);
+				Zero = count - Good;
+			}
+			if (Good)
+				memcpy(out, &(*File.Data)[start], Good);
+			if (Zero)
+				memset(out + Good, 0, Zero);
+			return Good;
+		}
+
+		int write(const char *path, const char *out, size_t count, off_t start, struct fuse_file_info *fi)
+		{
+			OPER
+			auto &File = GetFile(fi);
+			auto const End = start + count;
+			if (File.Data->size() < End)
+			{
+				File.Data->resize(End);
+				File.stat.st_size = End;
+			}
+			memcpy(&(*File.Data)[start], out, count);
+			return count;
+		}
+
+		int truncate(const char *path, off_t size)
+		{
+			OPER
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			auto &File = Found->second;
+			off_t OldLength = File.Data->size();
+			size_t Zero = 0;
+			if (OldLength < size)
+				Zero = size - OldLength;
+			File.Data->resize(size);
+			if (Zero) memset(&(*File.Data)[OldLength], 0, Zero);
+			File.stat.st_size = size;
+			return 0;
+		}
+
+		int chmod(const char *path, mode_t mode)
+		{
+			OPER
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			Found->second.stat.st_mode = mode;
+			return 0;
+		}
+
+		int chown(const char *path, uid_t uid, gid_t gid)
+		{
+			OPER
+			auto Found = Files.find(path);
+			if (Found == Files.end()) return -ENOENT;
+			Found->second.stat.st_uid = uid;
+			Found->second.stat.st_gid = gid;
+			return 0;
+		}
+		
+		// Utility methods
+		bool DecrementCount(void)
+		{
+			if (OperationCount < 0) return true;
+			OperationCount -= 1;
+			if (OperationCount == 0) return false;
+			return true;
+		}
+
+
 		void SetFile(struct fuse_file_info *fi, FileT &File)
 		{
 			fi->fh = reinterpret_cast<uint64_t>(&File);
@@ -310,84 +358,12 @@ struct FilesystemT
 			return *reinterpret_cast<FileT *>(fi->fh);
 		}
 
-		int64_t Count;
+		std::mutex &Mutex;
+		int64_t OpenCount;
+		int64_t OperationCount;
 
 		std::map<std::string, FileT> Files;
 };
-
-template <typename CallbackT>
-	void Accept(
-		asio::io_service &Service, 
-		asio::ip::tcp::acceptor &Acceptor, 
-		CallbackT &&Callback,
-		size_t RetryCount = 0)
-{
-	std::shared_ptr<asio::ip::tcp::socket> Connection;
-	try
-	{
-		Connection = std::make_shared<asio::ip::tcp::socket>(Service);
-	}
-	catch (...)
-	{
-		if (RetryCount >= 5) throw;
-		auto Retry = std::make_shared<asio::basic_waitable_timer<std::chrono::system_clock>>(Service, std::chrono::minutes(1));
-		auto &RetryRef = *Retry;
-		RetryRef.async_wait([&, Retry = std::move(Retry), Callback = std::move(Callback)](
-			asio::error_code const &Error)
-		{
-			Accept(Service, Acceptor, std::move(Callback), RetryCount + 1);
-		});
-		return;
-	}
-	auto &ConnectionRef = *Connection;
-	auto Endpoint = std::make_shared<asio::ip::tcp::endpoint>();
-	auto &EndpointRef = *Endpoint;
-	Acceptor.async_accept(
-		ConnectionRef, 
-		EndpointRef,
-		[&Service, &Acceptor, Endpoint = std::move(Endpoint), Connection = std::move(Connection), Callback = std::move(Callback)](
-			asio::error_code const &Error)
-		{
-			if (Error)
-			{
-				std::cerr << "Error accepting connection to " << *Endpoint << ": " 
-					"(" << Error.value() << ") " << Error << std::endl;
-				return;
-			}
-			if (Callback(std::move(Connection)))
-				Accept(Service, Acceptor, std::move(Callback));
-		});
-}
-
-template <typename CallbackT>
-	void Read(
-		std::shared_ptr<asio::ip::tcp::socket> Connection, 
-		std::shared_ptr<ReadBufferT> Buffer, 
-		CallbackT &&Callback)
-{
-	Buffer->Ensure(256);
-	auto BufferStart = Buffer->EmptyStart();
-	auto BufferSize = Buffer->Available();
-	auto &ConnectionRef = *Connection;
-	ConnectionRef.async_receive(
-		asio::buffer(BufferStart, BufferSize), 
-		[Connection = std::move(Connection), Buffer = std::move(Buffer), Callback = std::move(Callback)](
-			asio::error_code const &Error, 
-			size_t ReadSize) mutable
-		{
-			if (Error)
-			{
-				std::cerr << "Error reading: (" << Error.value() << ") " << Error << std::endl;
-				return;
-			}
-			Buffer->Fill(ReadSize);
-			if (Callback(*Buffer))
-				Read(
-					std::move(Connection), 
-					std::move(Buffer), 
-					std::move(Callback));
-		});
-}
 
 int main(int argc, char **argv)
 {
@@ -417,7 +393,9 @@ int main(int argc, char **argv)
 			FilesystemT Filesystem;
 			FuseT<FilesystemT> Fuse;
 
-			SharedT(std::string const &Path) : Fuse(Path, Filesystem) {}
+			SharedT(std::string const &Path) : 
+				Filesystem(Mutex), 
+				Fuse(Path, Filesystem) {}
 		} Shared(argv[1]);
 
 		{
@@ -443,8 +421,7 @@ int main(int argc, char **argv)
 
 		// Start listeners on IPC thread
 		asio::ip::tcp::endpoint TCPEndpoint(asio::ip::tcp::v4(), Port);
-		asio::ip::tcp::acceptor TCPAcceptor(Shared.MainService, TCPEndpoint);
-		Accept(Shared.MainService, TCPAcceptor, [&Shared](std::shared_ptr<asio::ip::tcp::socket> Connection)
+		TCPListen(Shared.MainService, TCPEndpoint, [&Shared](std::shared_ptr<asio::ip::tcp::socket> Connection)
 		{
 			auto Reader = std::make_shared<luxem::reader>();
 			Reader->element([&Shared, Connection](std::shared_ptr<luxem::value> &&Data)
@@ -478,40 +455,40 @@ int main(int argc, char **argv)
 				auto Type = Data->get_type();
 				if (Type == "clean")
 				{
-					std::lock_guard<std::mutex> Guard(Shared.Mutex);
-					Shared.Filesystem.Clean();
+					auto Success = Shared.Filesystem.Clean();
+					Write(Connection, 
+						luxem::writer()
+							.type("clear_result")
+							.value(Success)
+							.dump());
 				}
 				else if (Type == "set_count")
 				{
+					bool Success = false;
 					try
 					{
-						std::lock_guard<std::mutex> Guard(Shared.Mutex);
 						Shared.Filesystem.SetCount(Data->as<luxem::primitive>().get_int());
+						Success = true;
 					}
 					catch (...)
 					{
 						Error(StringT()
 							<< "Bad count [" << luxem::writer().value(Data).dump() << "]");
+						Success = false;
 					}
+					Write(Connection, 
+						luxem::writer()
+							.type("set_result")
+							.value(Success)
+							.dump());
 				}
 				else if (Type == "get_count")
 				{
-					std::lock_guard<std::mutex> Guard(Shared.Mutex);
-					auto Buffer = std::make_shared<std::string>(
+					Write(Connection,
 						luxem::writer()
 							.type("count")
 							.value(Shared.Filesystem.GetCount())
 							.dump());
-					auto const &BufferArg = asio::buffer(Buffer->c_str(), Buffer->size());
-					asio::async_write(
-						*Connection, 
-						BufferArg, 
-						[Buffer = std::move(Buffer)](
-							asio::error_code const &Error, 
-							std::size_t WroteSize)
-						{
-							// noop
-						});
 				}
 				else
 				{
@@ -520,49 +497,31 @@ int main(int argc, char **argv)
 					return;
 				}
 			});
-			Read(std::move(Connection), std::make_shared<ReadBufferT>(), [&Shared, Reader](ReadBufferT &Buffer)
+			LoopRead(std::move(Connection), [&Shared, Reader](ReadBufferT &Buffer)
 			{
 				try
 				{
-					auto Consumed = Reader->feed((char const *)Buffer.FilledStart(), Buffer.Filled(), false);
+					auto Consumed = Reader->feed(
+						(char const *)Buffer.FilledStart(), 
+						Buffer.Filled(), 
+						false);
 					Buffer.Consume(Consumed);
+					return !Shared.Die;
 				}
-				catch (UserErrorT const &Error)
+				catch (...)
 				{
-					std::cerr << "Error: " << Error << std::endl;
+					Shared.ChildException = std::current_exception();
+					Shared.MainService.stop();
 					return false;
 				}
-				catch (SystemErrorT const &Error)
-				{
-					std::cerr << "System error: " << Error << std::endl;
-					return false;
-				}
-				catch (ConstructionErrorT const &Error)
-				{
-					std::cerr << "Uncaught error: " << Error << std::endl;
-					return false;
-				}
-				catch (std::runtime_error const &Error)
-				{
-					std::cerr << "Uncaught error: " << Error.what() << std::endl;
-					return false;
-				}
-				return !Shared.Die;
 			});
 			return !Shared.Die;
 		});
 
 		std::thread IPCThread([&Shared](void) 
 		{ 
-			try
-			{
-				Shared.MainService.run();
-				std::cout << "IPC stopped " << std::endl;
-			}
-			catch (...)
-			{
-				Shared.ChildException = std::current_exception();
-			}
+			Shared.MainService.run();
+			std::cout << "IPC stopped " << std::endl;
 		});
 
 		// Start fuse on other thread

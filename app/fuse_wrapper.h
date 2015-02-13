@@ -6,7 +6,33 @@
 #include <fuse_lowlevel.h>
 
 #include "../ren-cxx-basics/error.h"
+			
+struct CXXAbsurdity_LowPrecedence {};
+struct CXXAbsurdity_HighPrecedence : CXXAbsurdity_LowPrecedence {};
 
+template
+<
+	typename FilesystemT2,
+	typename Enable = decltype(&FilesystemT2::PreOperation)
+>
+	void CallPreOperation(FilesystemT2 *Filesystem, CXXAbsurdity_HighPrecedence)
+		{ Filesystem->PreOperation(); }
+
+template <typename FilesystemT2>
+	void CallPreOperation(FilesystemT2 *Filesystem, CXXAbsurdity_LowPrecedence)
+		{ }
+
+template
+<
+	typename FilesystemT2,
+	typename Enable = decltype(&FilesystemT2::PostOperation)
+>
+	void CallPostOperation(FilesystemT2 *Filesystem, CXXAbsurdity_HighPrecedence)
+		{ Filesystem->PostOperation(); }
+
+template <typename FilesystemT2>
+	void CallPostOperation(FilesystemT2 *Filesystem, CXXAbsurdity_LowPrecedence)
+		{ }
 
 template <typename MethodTypeT> struct GlueCallT;
 template <typename FilesystemT, typename ReturnT, typename ...ArgsT>
@@ -17,8 +43,12 @@ template <typename FilesystemT, typename ReturnT, typename ...ArgsT>
 	{
 		Dest = [](ArgsT ...Args) -> ReturnT
 		{ 
-			return (static_cast<FilesystemT *>(fuse_get_context()->private_data)->*Source)
+			auto Filesystem = static_cast<FilesystemT *>(fuse_get_context()->private_data);
+			CallPreOperation(Filesystem, CXXAbsurdity_HighPrecedence());
+			auto Result = (Filesystem->*Source)
 				(std::forward<ArgsT>(Args)...); 
+			CallPostOperation(Filesystem, CXXAbsurdity_HighPrecedence());
+			return Result;
 		};
 	}
 };
@@ -100,8 +130,6 @@ template <typename FilesystemT> struct FuseT
 			fuse *Context;
 			fuse_session *Session;
 
-			struct CXXAbsurdity_LowPrecedence {};
-			struct CXXAbsurdity_HighPrecedence : CXXAbsurdity_LowPrecedence {};
 #define PREP_SET_CALLBACK(name) \
 			template \
 			< \
