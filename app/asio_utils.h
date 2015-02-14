@@ -46,6 +46,7 @@ template <typename CallbackT>
 	auto &ConnectionRef = *Connection;
 	auto Endpoint = std::make_shared<asio::ip::tcp::endpoint>();
 	auto &EndpointRef = *Endpoint;
+	std::cout << "Accepting" << std::endl;
 	AcceptorRef.async_accept(
 		ConnectionRef, 
 		EndpointRef,
@@ -64,6 +65,7 @@ template <typename CallbackT>
 					"(" << Error.value() << ") " << Error << std::endl;
 				return;
 			}
+			std::cout << "Accepted" << std::endl;
 			if (Callback(std::move(Connection)))
 				TCPListenInternal(Service, std::move(Acceptor), std::move(Callback));
 		});
@@ -85,6 +87,7 @@ template <typename CallbackT>
 		uint8_t RetryCount)
 {
 	auto &ConnectionRef = *Connection;
+	std::cout << "Connecting" << std::endl;
 	ConnectionRef.async_connect(
 		Endpoint,
 		[
@@ -126,6 +129,7 @@ template <typename CallbackT>
 				});
 				return;
 			}
+			std::cout << "Connected" << std::endl;
 			Callback(std::move(Connection));
 		});
 }
@@ -136,6 +140,7 @@ template <typename ConnectionT, typename CallbackT>
 		CallbackT &&Callback)
 {
 	auto Buffer = std::make_shared<ReadBufferT>();
+	std::cout << "Reading" << std::endl;
 	LoopReadInternal(
 		std::move(Connection),
 		std::move(Buffer),

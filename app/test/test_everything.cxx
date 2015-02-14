@@ -20,7 +20,7 @@ struct ClunkerControlT
 		CleanCallbacks.emplace_back(std::move(Callback));
 	}
 		
-	typedef function<void(size_t)> GetOpCountCallbackT;
+	typedef function<void(int64_t)> GetOpCountCallbackT;
 	void GetOpCount(GetOpCountCallbackT &&Callback)
 	{
 		Write(Connection, 
@@ -32,7 +32,7 @@ struct ClunkerControlT
 	}
 
 	typedef function<void(bool Success)> SetOpCountCallbackT;
-	void SetOpCount(size_t Count, SetOpCountCallbackT &&Callback)
+	void SetOpCount(int64_t Count, SetOpCountCallbackT &&Callback)
 	{
 		Write(Connection, 
 			luxem::writer()
@@ -79,26 +79,28 @@ void ConnectClunker(
 				auto Type = Data->get_type();
 				if (Type == "clean_result")
 				{
+					AssertGT(Control->CleanCallbacks.size(), 0u);
 					auto Callback = std::move(Control->CleanCallbacks.front());
 					Control->CleanCallbacks.pop_front();
 					Callback(Data->as<luxem::primitive>().get_bool());
 				}
 				else if (Type == "set_result")
 				{
-					auto Callback = std::move(Control->GetOpCountCallbacks.front());
-					Control->GetOpCountCallbacks.pop_front();
+					AssertGT(Control->SetOpCountCallbacks.size(), 0u);
+					auto Callback = std::move(Control->SetOpCountCallbacks.front());
+					Control->SetOpCountCallbacks.pop_front();
 					Callback(Data->as<luxem::primitive>().get_bool());
 				}
 				else if (Type == "get_result")
 				{
-					auto Callback = std::move(Control->SetOpCountCallbacks.front());
-					Control->SetOpCountCallbacks.pop_front();
+					AssertGT(Control->GetOpCountCallbacks.size(), 0u);
+					auto Callback = std::move(Control->GetOpCountCallbacks.front());
+					Control->GetOpCountCallbacks.pop_front();
 					Callback(Data->as<luxem::primitive>().get_int());
 				}
 				else
 				{
-					std::cerr << "Unknown message type [" << Type << "]";
-					return;
+					throw SystemErrorT() << "Unknown message type [" << Type << "]";
 				}
 			});
 
@@ -122,19 +124,19 @@ struct CallbackChainT
 		{
 			return AddT(
 				Chain, 
-				Chain.Callbacks.insert(Last, std::move(Callback)));
+				++Chain.Callbacks.insert(Next, std::move(Callback)));
 		}
 		
 		friend struct CallbackChainT;
 		private:
-			AddT(CallbackChainT &Chain, std::list<CallbackT>::iterator Last) : 
+			AddT(CallbackChainT &Chain, std::list<CallbackT>::iterator Next) : 
 				Chain(Chain),
-				Last(Last)
+				Next(Next)
 			{
 			}
 
 			CallbackChainT &Chain;
-			std::list<CallbackT>::iterator Last;
+			std::list<CallbackT>::iterator Next;
 	};
 
 	AddT Add(CallbackT &&Callback)
@@ -144,7 +146,11 @@ struct CallbackChainT
 
 	void Next(void)
 	{
-		if (Callbacks.empty()) return;
+		if (Callbacks.empty()) 
+		{
+			std::cout << "No chain callbacks, next does nothing." << std::endl;
+			return;
+		}
 		auto Callback = std::move(Callbacks.front());
 		Callbacks.pop_front();
 		Callback();
@@ -181,6 +187,8 @@ int main(int argc, char **argv)
 
 		// Start clunker
 		auto Root = Filesystem::PathT::Qualify("test_root");
+		Root.GoTo();
+		/*
 		Root.CreateDirectory();
 		SubprocessT Filesystem(
 			MainService, 
@@ -194,6 +202,7 @@ int main(int argc, char **argv)
 			Filesystem.GetResult();
 			Assert(Root.DeleteDirectory());
 		});
+		*/
 		
 		// Connect to clunker
 		std::shared_ptr<ClunkerControlT> Control;
@@ -202,11 +211,52 @@ int main(int argc, char **argv)
 			ControlEndpoint, 
 			[&Chain, &Control](std::shared_ptr<ClunkerControlT> NewControl) 
 			{ 
+				std::cout << "Got connection, starting chain." << std::endl;
 				Control = std::move(NewControl); 
 				Chain.Next(); 
 			});
 
 		// Prepare tests
+		/*Chain
+			.Add([&Chain](void) 
+			{ 
+				std::cout << "one" << std::endl;
+				Chain.Next();
+			})
+			.Add([&Chain](void) 
+			{ 
+				std::cout << "two" << std::endl;
+				Chain.Next();
+			})
+			.Add([&Chain](void) 
+			{ 
+				std::cout << "three" << std::endl;
+				Chain.Next();
+			})
+			;
+		Chain
+			.Add([&Chain](void) 
+			{ 
+				std::cout << "four" << std::endl;
+				Chain.Next();
+			})
+			.Add([&Chain](void) 
+			{ 
+				std::cout << "five" << std::endl;
+				Chain.Next();
+			})
+			.Add([&Chain](void) 
+			{ 
+				std::cout << "six" << std::endl;
+				Chain.Next();
+			})
+			;*/
+		Chain.Add([&MainService](void) 
+		{ 
+			std::cout << "Tests completed successfully." << std::endl;
+			MainService.stop(); 
+		});
+
 		auto WrapTest = [&Chain, &Control](CallbackChainT::CallbackT &&Callback) mutable
 		{
 			return [&Chain, &Control, Callback = std::move(Callback)](void) mutable
@@ -220,14 +270,169 @@ int main(int argc, char **argv)
 							Chain.Next();
 						});
 					})
-					.Add([&Control, Callback = std::move(Callback)](void) mutable
-						{ Callback(); });
+					.Add([&Control, &Chain](void)
+					{
+						Control->SetOpCount(-1, [&Chain](bool Success) { Chain.Next(); });
+					})
+					.Add([&Control, &Chain, Callback = std::move(Callback)](void) mutable
+					{ 
+						Callback(); 
+					});
+				Chain.Next();
 			};
 		};
+		size_t TestIndex = 1;
 		Chain
-			.Add(WrapTest([](void) { std::cout << "ranninged test" << std::endl; })); // TODO
+			.Add(WrapTest([&TestIndex, &Chain](void) 
+			{ 
+				std::cout << TestIndex++ << " Noop test" << std::endl; 
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain, &Control](void) 
+			{ 
+				std::cout << TestIndex++ << " Test clearing" << std::endl; 
+				auto Path = Filesystem::PathT::Qualify("roast beef");
+				Filesystem::FileT::OpenWrite(Path).Write("logos");
+				Chain
+					.Add([&Control, &Chain](void)
+					{
+						Control->Clean([&Chain](bool Success) { Chain.Next(); });
+					})
+					.Add([&Control, &Chain, Path](void)
+					{
+						try
+						{
+							Filesystem::FileT::OpenRead(Path);
+							Assert(false);
+						}
+						catch (ConstructionErrorT const &Error) {}
+						Chain.Next();
+					})
+					;
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain, &Control](void) 
+			{ 
+				std::cout << TestIndex++ << " Test op count reset" << std::endl; 
+				auto Path = Filesystem::PathT::Qualify("roast beef");
+				Chain
+					.Add([&Control, &Chain](void)
+					{
+						Control->SetOpCount(0, [&Chain](bool Success) { Chain.Next(); });
+					})
+					.Add([&Control, &Chain, Path](void)
+					{
+						try
+						{
+							Filesystem::FileT::OpenWrite(Path).Write("logos");
+							Assert(false);
+						}
+						catch (ConstructionErrorT const &Error) {}
+						Chain.Next();
+					})
+					.Add([&Control, &Chain](void)
+					{
+						Control->SetOpCount(-1, [&Chain](bool Success) { Chain.Next(); });
+					})
+					.Add([&Control, &Chain, Path](void)
+					{
+						try
+						{
+							Filesystem::FileT::OpenWrite(Path).Write("logos");
+						}
+						catch (ConstructionErrorT const &Error) 
+						{
+							Assert(false);
+						}
+						Chain.Next();
+					})
+					;
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain, &Control](void) 
+			{ 
+				std::cout << TestIndex++ << " Test op count decrement" << std::endl; 
+				auto Path = Filesystem::PathT::Qualify("plaster");
+				Chain
+					.Add([&Control, &Chain](void)
+					{
+						Control->SetOpCount(2000, [&Chain](bool Success) { Chain.Next(); });
+					})
+					.Add([&Control, &Chain, Path](void)
+					{
+						Filesystem::FileT::OpenWrite(Path).Write("logos");
+						Chain.Next();
+					})
+					.Add([&Control, &Chain](void)
+					{
+						Control->GetOpCount([&Chain](int64_t Count) 
+						{ 
+							AssertGT(Count, 2000);
+							Chain.Next(); 
+						});
+					})
+					;
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain](void) 
+			{ 
+				std::cout << TestIndex++ << " Test various file ops" << std::endl; 
+				// TODO
+				// Create file
+				// Create dir
+				// Create file in dir
+				// Write to file in dir
+				// Write to file in dir
+				// Create subdir
+				// ls dir
+				// ls root
+				// rm nonempty dir
+				// mv file, original doesn't exist
+				// rm file, file doesn't exist
+				// create new file, empty
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain, &Control](void) 
+			{ 
+				std::cout << TestIndex++ << " Test scheduled clunk" << std::endl; 
+				auto Path = Filesystem::PathT::Qualify("chicken");
+				auto LastWritten = std::make_shared<std::string>();
+				Chain
+					.Add([&Control, &Chain](void)
+					{
+						Control->SetOpCount(200, [&Chain](bool Success) { Chain.Next(); });
+					})
+					.Add([&Control, &Chain, Path, LastWritten](void)
+					{
+						try
+						{
+							for (size_t Count = 0; Count < 1000; ++Count)
+							{
+								auto File = Filesystem::FileT::OpenWrite(Path);
+								*LastWritten = StringT() << Count;
+								File.Write(*LastWritten);
+							}
+						}
+						catch (...) {}
+						Chain.Next();
+					})
+					.Add([&Control, &Chain](void)
+					{
+						Control->SetOpCount(-1, [&Chain](bool Success) { Chain.Next(); });
+					})
+					.Add([&Control, &Chain, Path, LastWritten](void)
+					{
+						auto Buffer = Filesystem::FileT::OpenRead(Path).ReadAll();
+						AssertNE(
+							std::string((char const *)&Buffer[0], Buffer.size()),
+							*LastWritten);
+						Chain.Next();
+					})
+					;
+				Chain.Next();
+			}))
+			;
 
-		// Run
 		MainService.run();
 	}
 	catch (UserErrorT const &Error)

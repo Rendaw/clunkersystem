@@ -13,41 +13,42 @@ struct CXXAbsurdity_HighPrecedence : CXXAbsurdity_LowPrecedence {};
 template
 <
 	typename FilesystemT2,
-	typename Enable = decltype(&FilesystemT2::PreOperation)
+	typename Enable = decltype(&FilesystemT2::OperationBegin)
 >
-	void CallPreOperation(FilesystemT2 *Filesystem, CXXAbsurdity_HighPrecedence)
-		{ Filesystem->PreOperation(); }
+	void CallOperationBegin(FilesystemT2 *Filesystem, CXXAbsurdity_HighPrecedence)
+		{ Filesystem->OperationBegin(); }
 
 template <typename FilesystemT2>
-	void CallPreOperation(FilesystemT2 *Filesystem, CXXAbsurdity_LowPrecedence)
+	void CallOperationBegin(FilesystemT2 *Filesystem, CXXAbsurdity_LowPrecedence)
 		{ }
 
 template
 <
 	typename FilesystemT2,
-	typename Enable = decltype(&FilesystemT2::PostOperation)
+	typename Enable = decltype(&FilesystemT2::OperationEnd)
 >
-	void CallPostOperation(FilesystemT2 *Filesystem, CXXAbsurdity_HighPrecedence)
-		{ Filesystem->PostOperation(); }
+	void CallOperationEnd(FilesystemT2 *Filesystem, CXXAbsurdity_HighPrecedence)
+		{ Filesystem->OperationEnd(); }
 
 template <typename FilesystemT2>
-	void CallPostOperation(FilesystemT2 *Filesystem, CXXAbsurdity_LowPrecedence)
+	void CallOperationEnd(FilesystemT2 *Filesystem, CXXAbsurdity_LowPrecedence)
 		{ }
 
 template <typename MethodTypeT> struct GlueCallT;
 template <typename FilesystemT, typename ReturnT, typename ...ArgsT>
 	struct GlueCallT<ReturnT (FilesystemT::*)(ArgsT ...)> 
 {
-	template <ReturnT (FilesystemT::*Source)(ArgsT ...)>
+	template <ReturnT (FilesystemT::*Source)(ArgsT ...), char const *Name>
 		static void Apply(ReturnT (*&Dest)(ArgsT ...))
 	{
 		Dest = [](ArgsT ...Args) -> ReturnT
 		{ 
+			std::cout << "#Calling op " << Name << std::endl;
 			auto Filesystem = static_cast<FilesystemT *>(fuse_get_context()->private_data);
-			CallPreOperation(Filesystem, CXXAbsurdity_HighPrecedence());
+			CallOperationBegin(Filesystem, CXXAbsurdity_HighPrecedence());
 			auto Result = (Filesystem->*Source)
 				(std::forward<ArgsT>(Args)...); 
-			CallPostOperation(Filesystem, CXXAbsurdity_HighPrecedence());
+			CallOperationEnd(Filesystem, CXXAbsurdity_HighPrecedence());
 			return Result;
 		};
 	}
@@ -138,7 +139,8 @@ template <typename FilesystemT> struct FuseT
 			> \
 				void SetCallback_##name(FilesystemT2 const *, CXXAbsurdity_HighPrecedence) \
 			{ \
-				GlueCallT<decltype(&FilesystemT2::name)>::template Apply<&FilesystemT2::name>(Callbacks.name); \
+				static constexpr char Name[] = #name; \
+				GlueCallT<decltype(&FilesystemT2::name)>::template Apply<&FilesystemT2::name, Name>(Callbacks.name); \
 			} \
 			template <typename FilesystemT2> \
 				void SetCallback_##name(FilesystemT2 const *, CXXAbsurdity_LowPrecedence) \
