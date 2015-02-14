@@ -188,22 +188,21 @@ int main(int argc, char **argv)
 
 		// Start clunker
 		auto Root = Filesystem::PathT::Qualify("test_root");
-		Root.GoTo();
-		/*
+		//Root.GoTo();
 		Root.CreateDirectory();
-		SubprocessT Filesystem(
+		SubprocessT FilesystemProcess(
 			MainService, 
 			Filesystem::PathT::Qualify(argv[1]), 
 			{
 				Root.Render()
 			});
-		auto ClunkerCleanup = FinallyT([&Root, &Filesystem](void)
+		auto ClunkerCleanup = FinallyT([&Root, &FilesystemProcess](void)
 		{
-			Filesystem.Terminate();
-			Filesystem.GetResult();
+			FilesystemProcess.Terminate();
+			FilesystemProcess.GetResult();
 			Assert(Root.DeleteDirectory());
 		});
-		*/
+		Root.GoTo();
 		
 		// Connect to clunker
 		std::shared_ptr<ClunkerControlT> Control;
@@ -218,40 +217,6 @@ int main(int argc, char **argv)
 			});
 
 		// Prepare tests
-		/*Chain
-			.Add([&Chain](void) 
-			{ 
-				std::cout << "one" << std::endl;
-				Chain.Next();
-			})
-			.Add([&Chain](void) 
-			{ 
-				std::cout << "two" << std::endl;
-				Chain.Next();
-			})
-			.Add([&Chain](void) 
-			{ 
-				std::cout << "three" << std::endl;
-				Chain.Next();
-			})
-			;
-		Chain
-			.Add([&Chain](void) 
-			{ 
-				std::cout << "four" << std::endl;
-				Chain.Next();
-			})
-			.Add([&Chain](void) 
-			{ 
-				std::cout << "five" << std::endl;
-				Chain.Next();
-			})
-			.Add([&Chain](void) 
-			{ 
-				std::cout << "six" << std::endl;
-				Chain.Next();
-			})
-			;*/
 		Chain.Add([&MainService](void) 
 		{ 
 			std::cout << "Tests completed successfully." << std::endl;

@@ -107,7 +107,7 @@ template <typename CallbackT>
 					std::endl;
 				if (RetryCount >= 5) return;
 				auto Retry = std::make_shared<asio::basic_waitable_timer<std::chrono::system_clock>>
-					(Service, std::chrono::minutes(1));
+					(Service, std::chrono::seconds(5));
 				auto &RetryRef = *Retry;
 				RetryRef.async_wait(
 					[
