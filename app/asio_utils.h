@@ -101,11 +101,11 @@ template <typename CallbackT>
 		{
 			if (Error)
 			{
-				if (RetryCount >= 5) return;
 				std::cerr << "Failed to connect to " << Endpoint << 
 					" (attempt " << (int)RetryCount << ")"
 					": " << Error <<
 					std::endl;
+				if (RetryCount >= 5) return;
 				auto Retry = std::make_shared<asio::basic_waitable_timer<std::chrono::system_clock>>
 					(Service, std::chrono::minutes(1));
 				auto &RetryRef = *Retry;

@@ -44,7 +44,20 @@ template <typename FilesystemT, typename ReturnT, typename ...ArgsT>
 		Dest = [](ArgsT ...Args) -> ReturnT
 		{ 
 			std::cout << "#Calling op " << Name << std::endl;
-			auto Filesystem = static_cast<FilesystemT *>(fuse_get_context()->private_data);
+
+			auto &FuseContext = *fuse_get_context();
+			auto Filesystem = static_cast<FilesystemT *>(FuseContext.private_data);
+
+			// If from own process, noop with success
+			// Requests to our own mounted fs are used to notify the os of out of band changes
+			std::cout << "op tid " << FuseContext.pid << std::endl;
+			if (Filesystem->OutOfBandThreadIDs.count(FuseContext.pid))
+			{
+				std::cout << "pid is oob" << std::endl;
+				return 0;
+			}
+
+			// Otherwise, call the implementation's method
 			CallOperationBegin(Filesystem, CXXAbsurdity_HighPrecedence());
 			auto Result = (Filesystem->*Source)
 				(std::forward<ArgsT>(Args)...); 

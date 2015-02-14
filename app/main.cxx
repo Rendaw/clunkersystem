@@ -5,10 +5,13 @@
 #include <luxem-cxx/luxem.h>
 #include <thread>
 #include <fcntl.h>
+#include <set>
+#include <sys/syscall.h>
 
 #include "../ren-cxx-basics/error.h"
 #include "../ren-cxx-basics/variant.h"
 #include "../ren-cxx-filesystem/file.h"
+#include "../ren-cxx-filesystem/path.h"
 
 #include "fuse_wrapper.h"
 #include "asio_utils.h"
@@ -28,26 +31,37 @@ struct timespec Now(void)
 	return Out;
 }
 
+typedef std::vector<uint8_t> RegularFileDataT;
+typedef std::string SymlinkPathT;
+
 struct FileT
 {
 	struct stat stat;
-	OptionalT<std::vector<uint8_t>> Data;
+	VariantT<SymlinkPathT, RegularFileDataT> Data;
 
 	FileT(void) : stat() 
 	{
 		stat.st_atim = Now();
 		stat.st_mtim = Now();
 		stat.st_ctim = Now();
-		stat.st_uid = getuid();
-		stat.st_gid = getgid();
+		stat.st_uid = 0;
+		stat.st_gid = 0;
 	}
 };
 
 struct FilesystemT
 {
-	FilesystemT(std::mutex &Mutex) : Mutex(Mutex), OperationCount(-1), Root(std::make_shared<FileT>())
+	std::set<pid_t> OutOfBandThreadIDs;
+
+	FilesystemT(std::string MountPath, std::mutex &Mutex) : 
+		MountPath(Filesystem::PathT::Qualify(MountPath)),
+		Mutex(Mutex), 
+		OperationCount(-1), 
+		Root(std::make_shared<FileT>())
 	{
 		Files.emplace(std::string("/"), Root);
+		Root->stat.st_uid = getuid();
+		Root->stat.st_gid = getgid();
 		Root->stat.st_mode = 
 			S_IFDIR |
 			S_IRUSR | S_IWUSR | S_IXUSR |
@@ -58,6 +72,15 @@ struct FilesystemT
 	bool Clean(void) 
 	{
 		std::lock_guard<std::mutex> Guard(Mutex);
+		for (auto File = Files.rbegin(); File != Files.rend(); ++File)
+		{
+			if (File->first == "/") continue;
+			std::cout << "Cleaning " << MountPath.EnterRaw(File->first) << std::endl;
+			auto Path = MountPath.EnterRaw(File->first).Render();
+			if (File->second->Data)
+				AssertE(::unlink(Path.c_str()), 0);
+			else AssertE(::rmdir(Path.c_str()), 0);
+		}
 		Files.clear(); 
 		Files.emplace(std::string("/"), Root);
 		return true;
@@ -79,7 +102,6 @@ struct FilesystemT
 	// FuseT interface
 	void OperationBegin(void)
 	{
-		std::cout << "op" << std::endl;
 		Mutex.lock();
 	}
 
@@ -109,7 +131,16 @@ struct FilesystemT
 			(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
 			(fi->flags == O_WRONLY) || (fi->flags == O_RDWR),
 			false)) return -EACCES;
-		if (Found->second->Data) return -ENOTDIR;
+		if (Found->second->Data) 
+		{
+			if (Found->second->Data.Is<SymlinkPathT>())
+			{
+				auto Found2 = Files.find(Found->second->Data.Get<SymlinkPathT>());
+				if (Found2 == Files.end()) return -ENOENT;
+				if (Found2->second->Data) return -ENOTDIR;
+			}
+			else return -ENOTDIR;
+		}
 		return 0;
 	}
 
@@ -117,7 +148,7 @@ struct FilesystemT
 	{
 		std::string Path(path);
 		off_t Count = 0;
-		for (auto Test = ++Files.lower_bound(Path); InDir(Test, Path); ++Test)
+		for (auto Test = ++Files.lower_bound(Path); IterInDir(Test, Path); ++Test)
 		{
 			OPER
 			if (Count < offset) continue;
@@ -133,6 +164,9 @@ struct FilesystemT
 	{
 		OPER
 		auto Root = Files.emplace(std::string(path), std::make_shared<FileT>()).first;
+		auto const &fuse_context = *fuse_get_context();
+		Root->second->stat.st_uid = fuse_context.uid;
+		Root->second->stat.st_gid = fuse_context.gid;
 		Root->second->stat.st_mode = 
 			mode |
 			S_IFDIR;
@@ -148,7 +182,7 @@ struct FilesystemT
 		if (Found->second->Data) return -ENOTDIR;
 		auto Next = Found;
 		++Next;
-		if (InDir(Next, Path)) return -ENOTEMPTY;
+		if (IterInDir(Next, Path)) return -ENOTEMPTY;
 		Files.erase(Found);
 		return 0;
 	}
@@ -157,11 +191,13 @@ struct FilesystemT
 	{
 		OPER
 		auto Root = Files.emplace(std::string(path), std::make_shared<FileT>()).first;
-		Root->second->stat.st_mode = mode;
+		auto const &fuse_context = *fuse_get_context();
+		Root->second->stat.st_uid = fuse_context.uid;
+		Root->second->stat.st_gid = fuse_context.gid;
 		Root->second->stat.st_mode = 
 			mode |
 			S_IFREG;
-		Root->second->Data = std::vector<uint8_t>();
+		Root->second->Data = RegularFileDataT();
 		SetFile(fi, Root->second);
 		return 0;
 	}
@@ -212,6 +248,12 @@ struct FilesystemT
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
+		if (!Found->second->Data) return -EPERM;
+		if (Found->second->Data.Is<SymlinkPathT>())
+		{
+			Found = Files.find(Found->second->Data.Get<SymlinkPathT>());
+			if (Found == Files.end()) return -ENOENT;
+		}
 		if (!CheckPermission(
 			*Found->second,
 			(fi->flags == O_RDONLY) || (fi->flags == O_RDWR),
@@ -225,17 +267,18 @@ struct FilesystemT
 	{
 		OPER
 		auto &File = GetFile(fi);
+		auto &Data = File.Data.Get<RegularFileDataT>();
 		size_t Good = 0;
 		size_t Zero = 0;
-		if ((unsigned int)start >= File.Data->size())
+		if ((unsigned int)start >= Data.size())
 			Zero = count;
 		else 
 		{
-			Good = std::max(count, File.Data->size() - start);
+			Good = std::max(count, Data.size() - start);
 			Zero = count - Good;
 		}
 		if (Good)
-			memcpy(out, &(*File.Data)[start], Good);
+			memcpy(out, &Data[start], Good);
 		if (Zero)
 			memset(out + Good, 0, Zero);
 		return Good;
@@ -245,13 +288,14 @@ struct FilesystemT
 	{
 		OPER
 		auto &File = GetFile(fi);
+		auto &Data = File.Data.Get<RegularFileDataT>();
 		auto const End = start + count;
-		if (File.Data->size() < End)
+		if (Data.size() < End)
 		{
-			File.Data->resize(End);
+			Data.resize(End);
 			File.stat.st_size = End;
 		}
-		memcpy(&(*File.Data)[start], out, count);
+		memcpy(&Data[start], out, count);
 		return count;
 	}
 
@@ -260,13 +304,20 @@ struct FilesystemT
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
+		if (!Found->second->Data) return -EPERM;
+		if (Found->second->Data.Is<SymlinkPathT>())
+		{
+			Found = Files.find(Found->second->Data.Get<SymlinkPathT>());
+			if (Found == Files.end()) return -ENOENT;
+		}
 		auto &File = *Found->second;
-		off_t OldLength = File.Data->size();
+		auto &Data = File.Data.Get<RegularFileDataT>();
+		off_t OldLength = Data.size();
 		size_t Zero = 0;
 		if (OldLength < size)
 			Zero = size - OldLength;
-		File.Data->resize(size);
-		if (Zero) memset(&(*File.Data)[OldLength], 0, Zero);
+		Data.resize(size);
+		if (Zero) memset(&Data[OldLength], 0, Zero);
 		File.stat.st_size = size;
 		return 0;
 	}
@@ -289,7 +340,43 @@ struct FilesystemT
 		Found->second->stat.st_gid = gid;
 		return 0;
 	}
-		
+
+	int rename(const char *from, const char *to)
+	{
+		OPER
+		auto Found = Files.find(from);
+		if (Found == Files.end()) return -ENOENT;
+		Files.emplace(to, Found->second);
+		Files.erase(Found);
+		return 0;
+	}
+
+	int link(const char *from, const char *to)
+	{
+		OPER
+		auto Found = Files.find(from);
+		if (Found == Files.end()) return -ENOENT;
+		Files.emplace(to, Found->second);
+		return 0;
+	}
+	
+	int symlink(const char *to, const char *from)
+	{
+		OPER
+		auto Result = Files.emplace(std::string(from), std::make_shared<FileT>());
+		auto Root = Result.first;
+		Root->second->Data = SymlinkPathT(to);
+		auto const &fuse_context = *fuse_get_context();
+		Root->second->stat.st_uid = fuse_context.uid;
+		Root->second->stat.st_gid = fuse_context.gid;
+		Root->second->stat.st_mode = 
+			S_IFLNK |
+			S_IRUSR | S_IWUSR | S_IXUSR |
+			S_IRGRP | S_IWGRP | S_IXGRP |
+			S_IROTH | S_IWOTH | S_IXOTH;
+		return 0;
+	}
+
 	friend struct FuseT<FilesystemT>;
 	private:
 		// Utility methods
@@ -304,14 +391,20 @@ struct FilesystemT
 			OperationCount -= 1;
 			return true;
 		}
-	
+
 		template <typename IteratorT>
-			bool InDir(IteratorT const &Test, std::string const &Path)
+			bool IterInDir(IteratorT const &Test, std::string const &Dir)
+		{
+			return 
+				(Test != Files.end()) &&
+				InDir(Test->first, Dir);
+		}
+	
+		bool InDir(std::string const &Test, std::string const &Dir)
 		{
 			return
-				(Test != Files.end()) &&
-				(Test->first.size() > Path.size()) &&
-				(Test->first.substr(0, Path.size()) == Path);
+				(Test.size() > Dir.size()) &&
+				(Test.substr(0, Dir.size()) == Dir);
 		}
 	
 		bool CheckPermission(FileT &File, bool Read, bool Write, bool Execute)
@@ -319,8 +412,9 @@ struct FilesystemT
 			auto const &st_mode = File.stat.st_mode;
 			auto const &st_uid = File.stat.st_uid;
 			auto const &st_gid = File.stat.st_gid;
-			auto const uid = getuid();
-			auto const gid = getgid();
+			auto const &fuse_context = *fuse_get_context();
+			auto const uid = fuse_context.uid;
+			auto const gid = fuse_context.gid;
 			return
 				(
 					!Read ||
@@ -363,6 +457,8 @@ struct FilesystemT
 			delete reinterpret_cast<std::shared_ptr<FileT> *>(fi->fh);
 		}
 
+		Filesystem::PathT MountPath;
+
 		std::mutex &Mutex;
 		int64_t OperationCount;
 
@@ -399,7 +495,7 @@ int main(int argc, char **argv)
 			FuseT<FilesystemT> Fuse;
 
 			SharedT(std::string const &Path) : 
-				Filesystem(Mutex), 
+				Filesystem(Path, Mutex), 
 				Fuse(Path, Filesystem) {}
 		} Shared(argv[1]);
 
@@ -506,6 +602,13 @@ int main(int argc, char **argv)
 
 		std::thread IPCThread([&Shared](void) 
 		{ 
+#ifdef SYS_gettid
+			auto tid = syscall(SYS_gettid);
+#else
+#error "SYS_gettid unavailable on this system"
+#endif
+			std::cout << "oob tid is " << tid << std::endl;
+			Shared.Filesystem.OutOfBandThreadIDs.insert(tid);
 			Shared.MainService.run();
 			std::cout << "IPC stopped " << std::endl;
 		});

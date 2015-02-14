@@ -91,7 +91,7 @@ void ConnectClunker(
 					Control->SetOpCountCallbacks.pop_front();
 					Callback(Data->as<luxem::primitive>().get_bool());
 				}
-				else if (Type == "get_result")
+				else if (Type == "count")
 				{
 					AssertGT(Control->GetOpCountCallbacks.size(), 0u);
 					auto Callback = std::move(Control->GetOpCountCallbacks.front());
@@ -167,8 +167,9 @@ int main(int argc, char **argv)
 		// Check arguments, prepare config
 		if (argc < 2) throw UserErrorT() << "Missing clunkersystem executable argument.";
 
-		static constexpr uint16_t ControlPort = 4522;
-		setenv("CLUNKER_PORT", (StringT() << ControlPort).str().c_str(), 1);
+		uint16_t ControlPort = 0;
+		if (!getenv("CLUNKER_PORT")) throw UserErrorT() << "CLUNKER_PORT env variable is not set.";
+		StringT(getenv("CLUNKER_PORT")) >> ControlPort;
 		asio::ip::tcp::endpoint ControlEndpoint(
 			asio::ip::address_v4::loopback(),
 			ControlPort);
@@ -367,7 +368,7 @@ int main(int argc, char **argv)
 					{
 						Control->GetOpCount([&Chain](int64_t Count) 
 						{ 
-							AssertGT(Count, 2000);
+							AssertLT(Count, 2000);
 							Chain.Next(); 
 						});
 					})
@@ -404,16 +405,16 @@ int main(int argc, char **argv)
 					})
 					.Add([&Control, &Chain, Path, LastWritten](void)
 					{
-						try
+						for (size_t Count = 0; Count < 1000; ++Count)
 						{
-							for (size_t Count = 0; Count < 1000; ++Count)
+							try
 							{
-								auto File = Filesystem::FileT::OpenWrite(Path);
 								*LastWritten = StringT() << Count;
+								auto File = Filesystem::FileT::OpenWrite(Path);
 								File.Write(*LastWritten);
 							}
+							catch (...) {}
 						}
-						catch (...) {}
 						Chain.Next();
 					})
 					.Add([&Control, &Chain](void)
