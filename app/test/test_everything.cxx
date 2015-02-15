@@ -5,7 +5,7 @@
 #include "../../ren-cxx-basics/variant.h"
 #include "../../ren-cxx-basics/function.h"
 #include "../../ren-cxx-basics/error.h"
-#include "subprocess.h"
+#include "../../ren-cxx-subprocess/subprocess.h"
 
 struct ClunkerControlT
 {

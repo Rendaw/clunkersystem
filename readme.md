@@ -12,11 +12,11 @@ Please don't store important files in your clunkersystem mounts.
 ```bash
 CLUNKER_PORT=4522 clunker MOUNTPOINT
 ```
-This will start a clunker mount at `MOUNTPOINT`.  The environment variable `CLUNKER_PORT` determines which TCP port is usedd to control out-of-band filesystem operations (bulk erase, staging failure, etc).
+This will start a clunker mount at `MOUNTPOINT`.  The environment variable `CLUNKER_PORT` determines which TCP port is used to control out-of-band filesystem operations.
 
 Send `SIGINT`, `SIGTERM`, or `SIGHUP` to gracefully unmount and terminate.
 
-#### API
+#### TCP Control
 
 Out of band filesystem operations are done using a [luxem](https://github.com/Rendaw/luxem) API.
 

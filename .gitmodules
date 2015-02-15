@@ -7,3 +7,6 @@
 [submodule "ren-cxx-filesystem"]
 	path = ren-cxx-filesystem
 	url = ../ren-cxx-filesystem
+[submodule "ren-cxx-subprocess"]
+	path = ren-cxx-subprocess
+	url = ../ren-cxx-subprocess
