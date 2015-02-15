@@ -6,6 +6,7 @@
 #include <iostream>
 
 #include "../ren-cxx-filesystem/file.h"
+#include "../ren-cxx-basics/function.h"
 
 template <typename CallbackT>
 	void TCPListen(
@@ -190,6 +191,51 @@ template <typename ConnectionT>
 			(asio::error_code const &Error, std::size_t WroteSize)
 				{});
 }
+
+struct CallbackChainT
+{
+	typedef function<void(void)> CallbackT;
+	struct AddT
+	{
+		AddT Add(CallbackT &&Callback)
+		{
+			return AddT(
+				Chain, 
+				++Chain.Callbacks.insert(Next, std::move(Callback)));
+		}
+		
+		friend struct CallbackChainT;
+		private:
+			AddT(CallbackChainT &Chain, std::list<CallbackT>::iterator Next) : 
+				Chain(Chain),
+				Next(Next)
+			{
+			}
+
+			CallbackChainT &Chain;
+			std::list<CallbackT>::iterator Next;
+	};
+
+	AddT Add(CallbackT &&Callback)
+	{
+		return AddT(*this, Callbacks.begin()).Add(std::move(Callback));
+	}
+
+	void Next(void)
+	{
+		if (Callbacks.empty()) 
+		{
+			std::cout << "No chain callbacks, next does nothing." << std::endl;
+			return;
+		}
+		auto Callback = std::move(Callbacks.front());
+		Callbacks.pop_front();
+		Callback();
+	}
+
+	private:
+		std::list<CallbackT> Callbacks;
+};
 
 #endif
 
