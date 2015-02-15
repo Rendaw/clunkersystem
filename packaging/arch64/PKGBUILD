@@ -1,0 +1,33 @@
+pkgname=clunkersystem
+pkgver=0.0.1
+pkgrel=1
+epoch=
+pkgdesc="An in-memory fuse filesystem with scheduled failure."
+arch=('x86_64')
+url="https://github.com/Rendaw/clunkersystem"
+license=('bsd')
+groups=()
+depends=()
+makedepends=()
+checkdepends=()
+optdepends=()
+provides=()
+conflicts=()
+replaces=()
+backup=()
+options=()
+install=
+changelog=
+source=($pkgname-$pkgver.tar.gz)
+noextract=()
+md5sums=('')
+
+BDIR=../../..
+PDIR=$BDIR/variant-package-arch64
+
+package() {
+	echo `pwd`
+	mkdir -p $pkgdir/usr/bin
+	cp $PDIR/app/clunker $pkgdir/usr/bin
+}
+
