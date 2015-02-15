@@ -1,8 +1,8 @@
 # clunkersystem v0.0.1
 
-Clunkersystem is an in-memory filesystem that can be cleared and staged to fail after a specified number of operations.  Expected uses are whatever you need an in-memory filesystem for as well as testing filesystem-transactional processes.
+Clunkersystem is an in-memory filesystem.  It can be easily wiped and staged to fail after a specified number of operations.  Expected uses are doing in-memory filesystem things as well as testing filesystem-transactional processes.
 
-Based on the technique described here: http://www.sqlite.org/testing.html
+Based on the testing technique described [here](http://www.sqlite.org/testing.html).
 
 Please don't store important files in your clunkersystem mounts.
 
@@ -18,7 +18,7 @@ Send `SIGINT`, `SIGTERM`, or `SIGHUP` to gracefully unmount and terminate.
 
 #### API
 
-Out of band filesystem operations are done using a (luxem)[https://github.com/Rendaw/luxem] API.
+Out of band filesystem operations are done using a [luxem](https://github.com/Rendaw/luxem) API.
 
 ##### Mass erase
 ```luxem
@@ -42,7 +42,7 @@ Will respond in the format:
 (set_result) true,
 ```
 
-The `true` indicates success.
+The `true` indicates success.  A count of `-1` disables the failure countdown - all operations will succeed.  Every operation performed on the filesystem (both reading and writing, statting files, etc) will decrement the count.
 
 ##### Get failure countdown
 ```luxem
@@ -61,7 +61,7 @@ Returns the count in the format:
 ```bash
 cd packaging/arch64
 ./create.sh
-pacman -U clunkersystem*.tgz
+pacman -U clunkersystem*.pkg.tar.xz
 ```
 
 ### Other Linux
