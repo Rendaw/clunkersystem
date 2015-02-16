@@ -9,16 +9,6 @@
 #include "../ren-cxx-basics/function.h"
 
 template <typename CallbackT>
-	void TCPListen(
-		asio::io_service &Service, 
-		asio::ip::tcp::endpoint &Endpoint,
-		CallbackT &&Callback)
-{
-	auto Acceptor = std::make_shared<asio::ip::tcp::acceptor>(Service, Endpoint);
-	TCPListenInternal(Service, std::move(Acceptor), std::move(Callback));
-}
-
-template <typename CallbackT>
 	void TCPListenInternal(
 		asio::io_service &Service, 
 		std::shared_ptr<asio::ip::tcp::acceptor> Acceptor, 
@@ -73,10 +63,13 @@ template <typename CallbackT>
 }
 
 template <typename CallbackT>
-	void TCPConnect(asio::io_service &Service, asio::ip::tcp::endpoint const &Endpoint, CallbackT &&Callback)
+	void TCPListen(
+		asio::io_service &Service, 
+		asio::ip::tcp::endpoint &Endpoint,
+		CallbackT &&Callback)
 {
-	auto Connection = std::make_shared<asio::ip::tcp::socket>(Service);
-	TCPConnectInternal(Service, std::move(Connection), Endpoint, std::move(Callback), 0);
+	auto Acceptor = std::make_shared<asio::ip::tcp::acceptor>(Service, Endpoint);
+	TCPListenInternal(Service, std::move(Acceptor), std::move(Callback));
 }
 
 template <typename CallbackT>
@@ -135,9 +128,23 @@ template <typename CallbackT>
 		});
 }
 
-template <typename ConnectionT, typename CallbackT>
+template <typename CallbackT>
+	void TCPConnect(asio::io_service &Service, asio::ip::tcp::endpoint const &Endpoint, CallbackT &&Callback)
+{
+	auto Connection = std::make_shared<asio::ip::tcp::socket>(Service);
+	TCPConnectInternal(Service, std::move(Connection), Endpoint, std::move(Callback), 0);
+}
+
+template <typename BufferT, typename CallbackT>
+        void UnifiedRead(asio::ip::tcp::socket &Connection, BufferT Buffer, CallbackT Callback)
+        { Connection.async_receive(std::forward<BufferT>(Buffer), std::forward<CallbackT>(Callback)); }
+template <typename BufferT, typename CallbackT>
+        void UnifiedRead(asio::posix::stream_descriptor &Connection, BufferT Buffer, CallbackT Callback)
+        { Connection.async_read_some(std::forward<BufferT>(Buffer), std::forward<CallbackT>(Callback)); }
+
+template <typename ConnectionPointerT, typename CallbackT>
 	void LoopRead(
-		std::shared_ptr<ConnectionT> Connection, 
+		ConnectionPointerT Connection, 
 		CallbackT &&Callback)
 {
 	auto Buffer = std::make_shared<ReadBufferT>();
@@ -148,9 +155,9 @@ template <typename ConnectionT, typename CallbackT>
 		std::move(Callback));
 }
 
-template <typename ConnectionT, typename CallbackT>
+template <typename ConnectionPointerT, typename CallbackT>
 	void LoopReadInternal(
-		std::shared_ptr<ConnectionT> Connection, 
+		ConnectionPointerT Connection, 
 		std::shared_ptr<ReadBufferT> Buffer, 
 		CallbackT &&Callback)
 {
@@ -158,7 +165,8 @@ template <typename ConnectionT, typename CallbackT>
 	auto BufferStart = Buffer->EmptyStart();
 	auto BufferSize = Buffer->Available();
 	auto &ConnectionRef = *Connection;
-	ConnectionRef.async_receive(
+	UnifiedRead(
+		ConnectionRef,
 		asio::buffer(BufferStart, BufferSize), 
 		[Connection = std::move(Connection), Buffer = std::move(Buffer), Callback = std::move(Callback)](
 			asio::error_code const &Error, 
@@ -178,8 +186,8 @@ template <typename ConnectionT, typename CallbackT>
 		});
 }
 			
-template <typename ConnectionT>
-	void Write(std::shared_ptr<ConnectionT> Connection, std::string const &Data)
+template <typename ConnectionPointerT>
+	void Write(ConnectionPointerT Connection, std::string const &Data)
 {
 	auto Buffer = std::make_shared<std::string>(Data);
 	auto const &BufferArg = asio::buffer(Buffer->c_str(), Buffer->size());

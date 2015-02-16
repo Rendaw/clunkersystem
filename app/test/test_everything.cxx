@@ -33,18 +33,37 @@ int main(int argc, char **argv)
 		// Start clunker
 		auto Root = Filesystem::PathT::Qualify("test_root");
 		//Root.GoTo();
-		Root.CreateDirectory();
 		SubprocessT FilesystemProcess(
 			MainService, 
 			Filesystem::PathT::Qualify(argv[1]), 
 			{
 				Root.Render()
 			});
+		LoopRead(&FilesystemProcess.Out, [](ReadBufferT &Buffer)
+		{
+			while (true)
+			{
+				auto Filled = Buffer.FilledStart();
+				size_t Consume = 0;
+				for (size_t At = 0; At < Buffer.Filled(); ++At)
+				{
+					if (Filled[At] == '\n')
+					{
+						std::cout << "Filesystem: " << std::string((char const *)&Filled[0], At + 1) << std::flush;
+						Consume = At + 1;
+						break;
+					}
+				}
+				if (Consume > 0)
+					Buffer.Consume(Consume);
+				else break;
+			}
+			return true;
+		});
 		auto ClunkerCleanup = FinallyT([&Root, &FilesystemProcess](void)
 		{
 			FilesystemProcess.Terminate();
 			FilesystemProcess.GetResult();
-			Assert(Root.DeleteDirectory());
 		});
 		Root.GoTo();
 		

@@ -473,6 +473,21 @@ int main(int argc, char **argv)
 	{
 		// Configure
 		if (argc < 2) throw UserErrorT() << "You must specify the mount point on the command line.";
+
+		OptionalT<FinallyT> RemoveRoot;
+		if (mkdir(argv[1], 0777) == 0)
+		{
+			std::cout << "hi, made dir [" << argv[1] << "]" << std::endl;
+			RemoveRoot = FinallyT([&argv](void)
+			{
+				if (rmdir(argv[1]) != 0)
+					throw UserErrorT() << "Could not remove mount directory [" << argv[1] << "]: " << strerror(errno);
+			});
+		}
+		else
+		{
+			std::cerr << "Could not create mount directory [" << argv[1] << "]: " << strerror(errno) << std::endl;
+		}
 		
 		uint16_t Port;
 		{
