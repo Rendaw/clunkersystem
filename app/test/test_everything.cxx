@@ -32,8 +32,8 @@ int main(int argc, char **argv)
 
 		// Start clunker
 		auto Root = Filesystem::PathT::Qualify("test_root");
-		//Root.GoTo();
-		SubprocessT FilesystemProcess(
+		Root.GoTo();
+		/*SubprocessT FilesystemProcess(
 			MainService, 
 			Filesystem::PathT::Qualify(argv[1]), 
 			{
@@ -65,7 +65,7 @@ int main(int argc, char **argv)
 			FilesystemProcess.Terminate();
 			FilesystemProcess.GetResult();
 		});
-		Root.GoTo();
+		Root.GoTo();*/
 		
 		// Connect to clunker
 		std::shared_ptr<ClunkerControlT> Control;
@@ -258,6 +258,48 @@ int main(int argc, char **argv)
 						Chain.Next();
 					})
 					;
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain](void) 
+			{ 
+				std::cout << TestIndex++ << " Read all valid" << std::endl; 
+				auto Path = Filesystem::PathT::Qualify("chicken");
+				Filesystem::FileT::OpenWrite(Path).Write("frog man eats cat");
+				auto File = open(Path.Render().c_str(), O_RDONLY);
+				std::vector<char> Buffer(8);
+				auto ReadSize = pread(File, &Buffer[0], 8, 0);
+				close(File);
+				AssertE(ReadSize, 8);
+				std::vector<char> Expected({'f', 'r', 'o', 'g', ' ', 'm', 'a', 'n'});
+				AssertE(Buffer, Expected);
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain](void) 
+			{ 
+				std::cout << TestIndex++ << " Read part valid" << std::endl; 
+				auto Path = Filesystem::PathT::Qualify("chicken");
+				Filesystem::FileT::OpenWrite(Path).Write("frog man eats cat");
+				auto File = open(Path.Render().c_str(), O_RDONLY);
+				std::vector<char> Buffer(8);
+				auto ReadSize = pread(File, &Buffer[0], 8, 12);
+				close(File);
+				AssertE(ReadSize, 5);
+				std::vector<char> Expected({'s', ' ', 'c', 'a', 't', 0, 0, 0});
+				AssertE(Buffer, Expected);
+				Chain.Next();
+			}))
+			.Add(WrapTest([&TestIndex, &Chain](void) 
+			{ 
+				std::cout << TestIndex++ << " Read all invalid" << std::endl; 
+				auto Path = Filesystem::PathT::Qualify("chicken");
+				Filesystem::FileT::OpenWrite(Path).Write("frog man eats cat");
+				auto File = open(Path.Render().c_str(), O_RDONLY);
+				std::vector<char> Buffer(8);
+				auto ReadSize = pread(File, &Buffer[0], 8, 20);
+				close(File);
+				AssertE(ReadSize, 0);
+				std::vector<char> Expected({0, 0, 0, 0, 0, 0, 0, 0});
+				AssertE(Buffer, Expected);
 				Chain.Next();
 			}))
 			;

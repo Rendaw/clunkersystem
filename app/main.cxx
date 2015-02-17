@@ -274,7 +274,7 @@ struct FilesystemT
 			Zero = count;
 		else 
 		{
-			Good = std::max(count, Data.size() - start);
+			Good = std::min(count, Data.size() - start);
 			Zero = count - Good;
 		}
 		if (Good)
@@ -383,11 +383,7 @@ struct FilesystemT
 		bool DecrementCount(void)
 		{
 			if (OperationCount < 0) return true;
-			if (OperationCount == 0) 
-			{
-				std::cout << "Op failed!" << std::endl;
-				return false;
-			}
+			if (OperationCount == 0) return false;
 			OperationCount -= 1;
 			return true;
 		}
@@ -477,7 +473,6 @@ int main(int argc, char **argv)
 		OptionalT<FinallyT> RemoveRoot;
 		if (mkdir(argv[1], 0777) == 0)
 		{
-			std::cout << "hi, made dir [" << argv[1] << "]" << std::endl;
 			RemoveRoot = FinallyT([&argv](void)
 			{
 				if (rmdir(argv[1]) != 0)
@@ -622,7 +617,6 @@ int main(int argc, char **argv)
 #else
 #error "SYS_gettid unavailable on this system"
 #endif
-			std::cout << "oob tid is " << tid << std::endl;
 			Shared.Filesystem.OutOfBandThreadIDs.insert(tid);
 			Shared.MainService.run();
 			std::cout << "IPC stopped " << std::endl;
