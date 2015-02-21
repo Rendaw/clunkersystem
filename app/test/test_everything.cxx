@@ -122,16 +122,26 @@ int main(int argc, char **argv)
 				std::cout << TestIndex++ << " Test clearing" << std::endl; 
 				auto Path = Filesystem::PathT::Qualify("roast beef");
 				Filesystem::FileT::OpenWrite(Path).Write("logos");
+				auto Dir = Filesystem::PathT::Qualify("ultimate_dir");
+				Dir.CreateDirectory();
+				auto Path2 = Dir.Enter("electrical.tape");
+				Filesystem::FileT::OpenWrite(Path2).Write("morose");
 				Chain
 					.Add([&Control, &Chain](void)
 					{
 						Control->Clean([&Chain](bool Success) { Chain.Next(); });
 					})
-					.Add([&Control, &Chain, Path](void)
+					.Add([&Control, &Chain, Path, Path2](void)
 					{
 						try
 						{
 							Filesystem::FileT::OpenRead(Path);
+							Assert(false);
+						}
+						catch (ConstructionErrorT const &Error) {}
+						try
+						{
+							Filesystem::FileT::OpenRead(Path2);
 							Assert(false);
 						}
 						catch (ConstructionErrorT const &Error) {}

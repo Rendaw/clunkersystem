@@ -1,3 +1,5 @@
+// TODO readlink
+
 #define BOOST_ASIO_ENABLE_HANDLER_TRACKING
 
 #include <asio.hpp>
@@ -14,6 +16,7 @@
 #include "../ren-cxx-filesystem/path.h"
 
 #include "fuse_wrapper.h"
+#include "fuse_outofband.h"
 #include "asio_utils.h"
 
 std::vector<function<void(void)>> SignalHandlers;
@@ -49,7 +52,7 @@ struct FileT
 	}
 };
 
-struct FilesystemT
+struct FilesystemT : OutOfBandControlT
 {
 	std::set<pid_t> OutOfBandThreadIDs;
 
@@ -72,14 +75,22 @@ struct FilesystemT
 	bool Clean(void) 
 	{
 		std::lock_guard<std::mutex> Guard(Mutex);
+		std::cout << "Cleaning list:" << std::endl;
+		for (auto File = Files.rbegin(); File != Files.rend(); ++File)
+			std::cout << "\t" << File->first << std::endl;
 		for (auto File = Files.rbegin(); File != Files.rend(); ++File)
 		{
 			if (File->first == "/") continue;
-			std::cout << "Cleaning " << MountPath.EnterRaw(File->first) << std::endl;
 			auto Path = MountPath.EnterRaw(File->first).Render();
+			std::cout << "Cleaning " << Path << std::endl;
 			if (File->second->Data)
-				AssertE(::unlink(Path.c_str()), 0);
-			else AssertE(::rmdir(Path.c_str()), 0);
+			{
+				if (!OOBRemoveFile(Path)) return false;
+			}
+			else 
+			{
+				if (!OOBRemoveDir(Path)) return false;
+			}
 		}
 		Files.clear(); 
 		Files.emplace(std::string("/"), Root);
@@ -100,20 +111,23 @@ struct FilesystemT
 	}
 
 	// FuseT interface
-	void OperationBegin(void)
+	void OperationBegin(bool const OutOfBand)
 	{
+		Assert(!OutOfBand);
 		Mutex.lock();
 	}
 
-	void OperationEnd(void)
+	void OperationEnd(bool const OutOfBand)
 	{
+		Assert(!OutOfBand);
 		Mutex.unlock();
 	}
 
 #define OPER if (!DecrementCount()) return -EIO;
 
-	int getattr(const char *path, struct stat *buf)
+	int getattr(bool const OutOfBand, const char *path, struct stat *buf)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
@@ -121,8 +135,9 @@ struct FilesystemT
 		return 0;
 	}
 
-	int opendir(const char *path, struct fuse_file_info *fi)
+	int opendir(bool const OutOfBand, const char *path, struct fuse_file_info *fi)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
@@ -133,35 +148,42 @@ struct FilesystemT
 			false)) return -EACCES;
 		if (Found->second->Data) 
 		{
-			if (Found->second->Data.Is<SymlinkPathT>())
+			/*if (Found->second->Data.Is<SymlinkPathT>())
 			{
 				auto Found2 = Files.find(Found->second->Data.Get<SymlinkPathT>());
 				if (Found2 == Files.end()) return -ENOENT;
 				if (Found2->second->Data) return -ENOTDIR;
 			}
-			else return -ENOTDIR;
+			else*/ return -ENOTDIR;
 		}
 		return 0;
 	}
 
-	int readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
+	int readdir(bool const OutOfBand, const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 	{
+		std::cout << "reading dir [" << path << "]" << std::endl;
+		Assert(!OutOfBand);
+		OPER
 		std::string Path(path);
 		off_t Count = 0;
 		for (auto Test = ++Files.lower_bound(Path); IterInDir(Test, Path); ++Test)
 		{
 			OPER
-			if (Count < offset) continue;
 			Count += 1;
-			auto Filename = Test->first.substr(Path.size());
+			std::cout << "rd " << Test->first << " @" << Count << std::endl;
+			if (Count <= offset) continue;
+			auto Filename = Test->first.substr(Path.size() == 1 ? 1 : Path.size() + 1);
+			std::cout << "\tfn " << Filename << std::endl;
 			if (Filename.find_first_of('/') != std::string::npos) continue;
+			std::cout << "\tg" << std::endl;
 			if (filler(buf, Filename.c_str(), &Test->second->stat, Count)) break;
 		}
 		return 0;
 	}
 
-	int mkdir(const char *path, mode_t mode)
+	int mkdir(bool const OutOfBand, const char *path, mode_t mode)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Root = Files.emplace(std::string(path), std::make_shared<FileT>()).first;
 		auto const &fuse_context = *fuse_get_context();
@@ -170,11 +192,13 @@ struct FilesystemT
 		Root->second->stat.st_mode = 
 			mode |
 			S_IFDIR;
+		this->IBCreate(path, true);
 		return 0;
 	}
 
-	int rmdir(const char *path)
+	int rmdir(bool const OutOfBand, const char *path)
 	{
+		Assert(!OutOfBand);
 		OPER
 		std::string Path(path);
 		auto Found = Files.find(path);
@@ -184,11 +208,13 @@ struct FilesystemT
 		++Next;
 		if (IterInDir(Next, Path)) return -ENOTEMPTY;
 		Files.erase(Found);
+		this->IBRemove(Path);
 		return 0;
 	}
 
-	int create(const char *path, mode_t mode, struct fuse_file_info *fi)
+	int create(bool const OutOfBand, const char *path, mode_t mode, struct fuse_file_info *fi)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Root = Files.emplace(std::string(path), std::make_shared<FileT>()).first;
 		auto const &fuse_context = *fuse_get_context();
@@ -199,17 +225,20 @@ struct FilesystemT
 			S_IFREG;
 		Root->second->Data = RegularFileDataT();
 		SetFile(fi, Root->second);
+		this->IBCreate(path, false);
 		return 0;
 	}
 	
-	int release(const char *path, struct fuse_file_info *fi)
+	int release(bool const OutOfBand, const char *path, struct fuse_file_info *fi)
 	{
+		Assert(!OutOfBand);
 		ClearFile(fi);
 		return 0;
 	}
 
-	int utimens(const char *path, const struct timespec tv[2])
+	int utimens(bool const OutOfBand, const char *path, const struct timespec tv[2])
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
@@ -219,8 +248,9 @@ struct FilesystemT
 		return 0;
 	}
 
-	int access(const char *path, int amode)
+	int access(bool const OutOfBand, const char *path, int amode)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
@@ -233,26 +263,29 @@ struct FilesystemT
 		return 0;
 	}
 
-	int unlink(const char *path)
+	int unlink(bool const OutOfBand, const char *path)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
 		if (!Found->second->Data) return -EPERM;
 		Files.erase(Found);
+		this->IBRemove(path);
 		return 0;
 	}
 
-	int open(const char *path, struct fuse_file_info *fi)
+	int open(bool const OutOfBand, const char *path, struct fuse_file_info *fi)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
 		if (!Found->second->Data) return -EPERM;
 		if (Found->second->Data.Is<SymlinkPathT>())
 		{
-			Found = Files.find(Found->second->Data.Get<SymlinkPathT>());
-			if (Found == Files.end()) return -ENOENT;
+			/*Found = Files.find(Found->second->Data.Get<SymlinkPathT>());
+			if (Found == Files.end())*/ return -ENOENT;
 		}
 		if (!CheckPermission(
 			*Found->second,
@@ -263,8 +296,9 @@ struct FilesystemT
 		return 0;
 	}
 
-	int read(const char *path, char *out, size_t count, off_t start, struct fuse_file_info *fi)
+	int read(bool const OutOfBand, const char *path, char *out, size_t count, off_t start, struct fuse_file_info *fi)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto &File = GetFile(fi);
 		auto &Data = File.Data.Get<RegularFileDataT>();
@@ -284,8 +318,9 @@ struct FilesystemT
 		return Good;
 	}
 
-	int write(const char *path, const char *out, size_t count, off_t start, struct fuse_file_info *fi)
+	int write(bool const OutOfBand, const char *path, const char *out, size_t count, off_t start, struct fuse_file_info *fi)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto &File = GetFile(fi);
 		auto &Data = File.Data.Get<RegularFileDataT>();
@@ -299,16 +334,17 @@ struct FilesystemT
 		return count;
 	}
 
-	int truncate(const char *path, off_t size)
+	int truncate(bool const OutOfBand, const char *path, off_t size)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
 		if (!Found->second->Data) return -EPERM;
 		if (Found->second->Data.Is<SymlinkPathT>())
 		{
-			Found = Files.find(Found->second->Data.Get<SymlinkPathT>());
-			if (Found == Files.end()) return -ENOENT;
+			/*Found = Files.find(Found->second->Data.Get<SymlinkPathT>());
+			if (Found == Files.end())*/ return -ENOENT;
 		}
 		auto &File = *Found->second;
 		auto &Data = File.Data.Get<RegularFileDataT>();
@@ -322,8 +358,9 @@ struct FilesystemT
 		return 0;
 	}
 
-	int chmod(const char *path, mode_t mode)
+	int chmod(bool const OutOfBand, const char *path, mode_t mode)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
@@ -331,8 +368,9 @@ struct FilesystemT
 		return 0;
 	}
 
-	int chown(const char *path, uid_t uid, gid_t gid)
+	int chown(bool const OutOfBand, const char *path, uid_t uid, gid_t gid)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(path);
 		if (Found == Files.end()) return -ENOENT;
@@ -341,27 +379,32 @@ struct FilesystemT
 		return 0;
 	}
 
-	int rename(const char *from, const char *to)
+	int rename(bool const OutOfBand, const char *from, const char *to)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(from);
 		if (Found == Files.end()) return -ENOENT;
 		Files.emplace(to, Found->second);
 		Files.erase(Found);
+		this->IBRename(from, to);
 		return 0;
 	}
 
-	int link(const char *from, const char *to)
+	int link(bool const OutOfBand, const char *from, const char *to)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Found = Files.find(from);
 		if (Found == Files.end()) return -ENOENT;
 		Files.emplace(to, Found->second);
+		this->IBLink(from, to);
 		return 0;
 	}
 	
-	int symlink(const char *to, const char *from)
+	int symlink(bool const OutOfBand, const char *to, const char *from)
 	{
+		Assert(!OutOfBand);
 		OPER
 		auto Result = Files.emplace(std::string(from), std::make_shared<FileT>());
 		auto Root = Result.first;
@@ -374,6 +417,20 @@ struct FilesystemT
 			S_IRUSR | S_IWUSR | S_IXUSR |
 			S_IRGRP | S_IWGRP | S_IXGRP |
 			S_IROTH | S_IWOTH | S_IXOTH;
+		this->IBLink(from, to);
+		return 0;
+	}
+
+	int readlink(bool const OutOfBand, char const *path, char *out, size_t out_size)
+	{
+		Assert(!OutOfBand);
+		OPER
+		auto Found = Files.find(path);
+		if (Found == Files.end()) return -ENOENT;
+		if (!Found->second->Data) return -EINVAL;
+		if (!Found->second->Data.Is<SymlinkPathT>()) return -EINVAL;
+		auto &Target = Found->second->Data.Get<SymlinkPathT>();
+		memcpy(out, Target.c_str(), std::min(out_size, Target.size()));
 		return 0;
 	}
 
@@ -501,8 +558,8 @@ int main(int argc, char **argv)
 			asio::io_service MainService;
 
 			std::mutex Mutex;
-			FilesystemT Filesystem;
-			FuseT<FilesystemT> Fuse;
+			OutOfBandFilesystemT<FilesystemT> Filesystem;
+			FuseT<OutOfBandFilesystemT<FilesystemT>> Fuse;
 
 			SharedT(std::string const &Path) : 
 				Filesystem(Path, Mutex), 
