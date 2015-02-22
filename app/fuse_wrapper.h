@@ -41,7 +41,8 @@ template <typename FilesystemT> struct FuseT
 
 	int Run(void)
 	{
-		auto Result = fuse_loop_mt(Context.Context);
+		//auto Result = fuse_loop_mt(Context.Context);
+		auto Result = fuse_loop(Context.Context);
 		return Result;
 	}
 
